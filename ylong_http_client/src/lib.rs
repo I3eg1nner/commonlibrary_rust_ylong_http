@@ -85,8 +85,14 @@ pub(crate) mod runtime {
         io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
         macros::support::poll_fn,
         net::TcpStream,
-        sync::{OwnedSemaphorePermit as SemaphorePermit, Semaphore},
         task::{spawn_blocking, JoinHandle},
+    };
+    // Runtime primitives needed by both the sync and async clients (the shared
+    // dispatcher and rate limiter use these) whenever the tokio runtime is
+    // selected. These tokio items do not require the `async` feature.
+    #[cfg(feature = "tokio_base")]
+    pub(crate) use tokio::{
+        sync::{OwnedSemaphorePermit as SemaphorePermit, Semaphore},
         time::{sleep, timeout, Sleep},
     };
     #[cfg(feature = "ylong_base")]

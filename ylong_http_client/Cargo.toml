@@ -86,6 +86,11 @@ path = "examples/async_proxy_http.rs"
 required-features = ["async", "http1_1", "tokio_base"]
 
 [[example]]
+name = "async_proxy_https"
+path = "examples/async_proxy_https.rs"
+required-features = ["async", "http1_1", "tokio_base", "__tls"]
+
+[[example]]
 name = "async_redirect_http"
 path = "examples/async_redirect_http.rs"
 required-features = ["async", "http1_1", "tokio_base"]
@@ -104,3 +109,9 @@ required-features = ["sync", "http1_1"]
 name = "sync_proxy_http"
 path = "examples/sync_proxy_http.rs"
 required-features = ["sync", "http1_1"]
+
+[[bench]]
+name = "https_proxy_bench"
+path = "benches/https_proxy_bench.rs"
+harness = false
+required-features = ["async", "http1_1", "tokio_base", "__tls"]

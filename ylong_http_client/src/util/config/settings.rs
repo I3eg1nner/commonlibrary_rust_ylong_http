@@ -448,6 +448,44 @@ impl ProxyBuilder {
         self
     }
 
+    /// Sets the TLS configuration used for the connection to the proxy server
+    /// itself (an HTTPS proxy), independent of the TLS configuration used for
+    /// the origin server.
+    ///
+    /// Build the [`TlsConfig`] with [`TlsConfig::builder`] to control
+    /// proxy-server certificate verification (CA roots via `ca_file` /
+    /// `add_root_certificates` for one-way verification, client certificate
+    /// for mutual TLS), protocol versions (`min_proto_version` /
+    /// `max_proto_version`), cipher suites (`cipher_list`), SNI (`sni`),
+    /// and the accept-invalid escape hatches — all scoped to the proxy
+    /// connection only.
+    ///
+    /// When the proxy URL uses the `https` scheme but no proxy `TlsConfig` is
+    /// set, a default configuration is used.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ylong_http_client::{Proxy, TlsConfig, TlsVersion};
+    ///
+    /// let proxy_tls = TlsConfig::builder()
+    ///     .min_proto_version(TlsVersion::TLS_1_2)
+    ///     .build()
+    ///     .unwrap();
+    ///
+    /// let proxy = Proxy::all("https://proxy.example.com")
+    ///     .tls_config(proxy_tls)
+    ///     .build();
+    /// ```
+    #[cfg(feature = "__tls")]
+    pub fn tls_config(mut self, config: crate::util::TlsConfig) -> Self {
+        self.inner = self.inner.map(|mut proxy| {
+            proxy.set_proxy_tls(config);
+            proxy
+        });
+        self
+    }
+
     /// Constructs a `Proxy`.
     ///
     /// # Examples

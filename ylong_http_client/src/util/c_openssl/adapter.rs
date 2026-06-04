@@ -196,6 +196,34 @@ impl TlsConfigBuilder {
         self
     }
 
+    /// Loads the private key from a file.
+    ///
+    /// The key must correspond to the certificate set via [`certificate_file`]
+    /// or [`certificate_chain_file`]; loading it enables presenting a
+    /// client certificate for mutual TLS (two-way certificate
+    /// verification). The key and certificate are checked for consistency.
+    ///
+    /// [`certificate_file`]: TlsConfigBuilder::certificate_file
+    /// [`certificate_chain_file`]: TlsConfigBuilder::certificate_chain_file
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ylong_http_client::{TlsConfigBuilder, TlsFileType};
+    ///
+    /// let builder = TlsConfigBuilder::new()
+    ///     .certificate_file("client.pem", TlsFileType::PEM)
+    ///     .private_key_file("client.key", TlsFileType::PEM);
+    /// ```
+    pub fn private_key_file<T: AsRef<Path>>(mut self, path: T, file_type: TlsFileType) -> Self {
+        self.inner = self.inner.and_then(|mut builder| {
+            builder
+                .set_private_key_file(path, file_type.into_inner())
+                .map(|_| builder)
+        });
+        self
+    }
+
     /// Adds custom root certificate.
     ///
     /// # Examples

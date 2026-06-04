@@ -17,6 +17,7 @@ use core::task::{Context, Poll};
 #[cfg(feature = "http3")]
 use ylong_runtime::net::ConnectedUdpSocket;
 
+use crate::async_impl::proxy::ProxyTunnel;
 use crate::async_impl::ssl_stream::AsyncSslStream;
 use crate::runtime::{AsyncRead, AsyncWrite, ReadBuf, TcpStream};
 
@@ -25,7 +26,11 @@ pub enum MixStream {
     /// A raw HTTP stream.
     Http(TcpStream),
     /// An SSL-wrapped HTTP stream.
-    Https(AsyncSslStream<TcpStream>),
+    ///
+    /// The origin TLS layer wraps a [`ProxyTunnel`], which is either a plain
+    /// TCP connection (direct or via a plaintext proxy tunnel) or a TLS
+    /// session to an HTTPS proxy (TLS-in-TLS).
+    Https(AsyncSslStream<ProxyTunnel>),
     #[cfg(feature = "http3")]
     /// A Udp connection
     Udp(ConnectedUdpSocket),

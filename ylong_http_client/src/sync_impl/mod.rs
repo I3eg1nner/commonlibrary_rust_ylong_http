@@ -43,6 +43,8 @@ pub use ylong_http::request::Request;
 pub use ylong_http::response::Response;
 
 #[cfg(feature = "__tls")]
+mod proxy;
+#[cfg(feature = "__tls")]
 mod ssl_stream;
 #[cfg(feature = "__tls")]
 pub use ssl_stream::MixStream;

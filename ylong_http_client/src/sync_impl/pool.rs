@@ -22,6 +22,12 @@ use crate::error::{ErrorKind, HttpClientError};
 use crate::sync_impl::Connector;
 use crate::util::dispatcher::{Conn, ConnDispatcher, Dispatcher};
 use crate::util::pool::{Pool, PoolKey};
+use crate::util::progress::SpeedConfig;
+
+/// Maximum number of pooled connections per host for the synchronous client.
+/// The synchronous `Conns` does not bound concurrency, so this is only the
+/// value threaded through `Pool::get`'s `create_fn`.
+const SYNC_MAX_CONN_NUM: usize = 6;
 
 pub(crate) struct ConnPool<C, S> {
     pool: Pool<PoolKey, Conns<S>>,
@@ -43,7 +49,7 @@ impl<C: Connector> ConnPool<C, C::Stream> {
         );
 
         self.pool
-            .get(key, Conns::new)
+            .get(key, Conns::new, SYNC_MAX_CONN_NUM, SpeedConfig::none())
             .conn(|| self.connector.clone().connect(&uri))
     }
 }
@@ -53,7 +59,10 @@ pub(crate) struct Conns<S> {
 }
 
 impl<S> Conns<S> {
-    fn new() -> Self {
+    /// Signature matches `Pool::get`'s `create_fn`. The synchronous pool does
+    /// not use the connection-count or speed parameters, so they are
+    /// ignored.
+    fn new(_max_conn_num: usize, _speed_config: SpeedConfig) -> Self {
         Self {
             list: Arc::new(Mutex::new(Vec::new())),
         }

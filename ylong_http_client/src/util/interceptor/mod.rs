@@ -13,8 +13,10 @@
 
 //! Http network interceptor.
 
+#[cfg(feature = "async")]
 use ylong_http::response::Response as HttpResp;
 
+#[cfg(feature = "async")]
 use crate::async_impl::{HttpBody, Request, Response};
 use crate::{ConnDetail, HttpClientError};
 
@@ -55,11 +57,13 @@ pub trait Interceptor {
     }
 
     /// Intercepts the Request that is eventually transmitted to the peer end.
+    #[cfg(feature = "async")]
     fn intercept_request(&self, _request: &Request) -> Result<(), HttpClientError> {
         Ok(())
     }
 
     /// Intercepts the response that is eventually returned.
+    #[cfg(feature = "async")]
     fn intercept_response(&self, _response: &Response) -> Result<(), HttpClientError> {
         Ok(())
     }
@@ -70,11 +74,13 @@ pub trait Interceptor {
     }
 
     /// Intercepts the redirect request.
+    #[cfg(feature = "async")]
     fn intercept_redirect_request(&self, _request: &Request) -> Result<(), HttpClientError> {
         Ok(())
     }
 
     /// Intercepts the response returned by the redirect
+    #[cfg(feature = "async")]
     fn intercept_redirect_response(
         &self,
         _response: &HttpResp<HttpBody>,

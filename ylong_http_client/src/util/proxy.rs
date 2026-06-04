@@ -91,6 +91,19 @@ impl Proxy {
         self.no_proxy = NoProxy::from_str(no_proxy);
     }
 
+    /// Sets the TLS configuration used for the connection to the proxy server
+    /// itself (HTTPS proxy). This is independent of the TLS configuration used
+    /// for the origin server.
+    #[cfg(feature = "__tls")]
+    pub(crate) fn set_proxy_tls(&mut self, config: crate::util::TlsConfig) {
+        let info = match &mut self.intercept {
+            Intercept::All(info) => info,
+            Intercept::Http(info) => info,
+            Intercept::Https(info) => info,
+        };
+        info.proxy_tls = Some(config);
+    }
+
     pub(crate) fn via_proxy(&self, uri: &Uri) -> Uri {
         let info = self.intercept.proxy_info();
         let mut builder = Uri::builder();
@@ -149,6 +162,11 @@ pub(crate) struct ProxyInfo {
     pub(crate) scheme: Scheme,
     pub(crate) authority: Authority,
     pub(crate) basic_auth: Option<HeaderValue>,
+    /// TLS configuration scoped to the proxy connection (HTTPS proxy). When the
+    /// proxy scheme is `https` and this is `None`, a default TLS configuration
+    /// is used.
+    #[cfg(feature = "__tls")]
+    pub(crate) proxy_tls: Option<crate::util::TlsConfig>,
 }
 
 impl ProxyInfo {
@@ -167,6 +185,8 @@ impl ProxyInfo {
             basic_auth: None,
             scheme: scheme.unwrap(),
             authority: authority.unwrap(),
+            #[cfg(feature = "__tls")]
+            proxy_tls: None,
         })
     }
 
@@ -176,6 +196,29 @@ impl ProxyInfo {
 
     pub(crate) fn scheme(&self) -> &Scheme {
         &self.scheme
+    }
+
+    /// Returns whether the proxy server itself is reached over TLS (HTTPS
+    /// proxy). True when the proxy scheme is `https` or an explicit proxy
+    /// TLS config is set.
+    #[cfg(feature = "__tls")]
+    pub(crate) fn is_tls(&self) -> bool {
+        self.scheme == Scheme::HTTPS || self.proxy_tls.is_some()
+    }
+
+    /// Returns the host name of the proxy server, used for the proxy TLS
+    /// handshake (SNI / hostname verification).
+    #[cfg(feature = "__tls")]
+    pub(crate) fn proxy_host(&self) -> String {
+        self.authority.host().as_str().to_string()
+    }
+
+    /// Returns the TLS configuration to use for the proxy connection, falling
+    /// back to a default configuration when the proxy is TLS-secured but no
+    /// explicit config was provided.
+    #[cfg(feature = "__tls")]
+    pub(crate) fn proxy_tls_config(&self) -> crate::util::TlsConfig {
+        self.proxy_tls.clone().unwrap_or_default()
     }
 }
 
