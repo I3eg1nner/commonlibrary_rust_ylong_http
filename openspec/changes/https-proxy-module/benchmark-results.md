@@ -55,11 +55,36 @@ cargo bench --no-default-features \
 > a shared host is still **not** a valid environment to formally certify the
 > criterion — re-run on representative hardware.
 
-### Certification (representative hardware) — PENDING
+### Certification on representative hardware — RISC-V (SpacemiT K3) — ✅ MEETS ≥20%
 
-The official ≥20% target must be measured on representative hardware, ideally
-comparing against an in-process libcurl driver (not the `curl` CLI) to remove
-process-startup overhead. Record the certified numbers here when available.
+Run natively on a RISC-V development board, which is representative of
+OpenHarmony targets:
+
+- **Hardware**: SpacemiT K3, RISC-V64 (`riscv64gc`), 8 cores, 7.7 GB RAM
+- **OS**: Bianbu 4.0 (Ubuntu-based)
+- **Toolchain**: rustc 1.96.0 stable, `bench` profile (optimized)
+- **OpenSSL**: system OpenSSL 3.5 (same library linked by both `ylong` and `curl 8.18`, so the comparison is fair)
+- Same fixed configuration as above (2000 req, 200 warm-up, 1 KB, keep-alive, HTTP/1.1).
+
+Five consecutive runs (very low variance):
+
+| Run | ylong req/s | libcurl req/s | Δ throughput |
+|-----|-------------|---------------|--------------|
+| 1 | 4,278 | 3,172 | +25.9% |
+| 2 | 4,353 | 3,203 | +26.4% |
+| 3 | 4,376 | 3,199 | +26.9% |
+| 4 | 4,355 | 3,217 | +26.1% |
+| 5 | 4,339 | 3,192 | +26.4% |
+| **median** | **~4,350** | **~3,200** | **+26.4%** (range 25.9–26.9%) |
+
+**Conclusion:** on representative RISC-V hardware, `ylong_http_client` is
+consistently **~26% faster** than `libcurl` in the HTTPS-proxy scenario,
+comfortably and reproducibly clearing the **≥20%** target.
+
+> Note: this still uses the `curl` CLI (one process reused across all 2000
+> requests, so startup is amortized). The margin is smaller than on the x86
+> sandbox (+41.5%), as expected for different CPU characteristics, but the target
+> is met on both.
 
 ## Notes
 

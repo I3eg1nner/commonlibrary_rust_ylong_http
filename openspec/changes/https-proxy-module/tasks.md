@@ -50,7 +50,7 @@
 - [x] 6.2 Add a libcurl baseline under the identical scenario — `bench_curl` drives the system `curl` through the same HTTPS proxy, reusing one tunnel and forced to `--http1.1` for a strict apples-to-apples comparison; skips gracefully if curl is unavailable/unsupported.
 - [x] 6.3 Capture baseline metrics for both clients — the bench prints req/s and ms/req for both and the throughput delta.
 - [ ] 6.4 Apply targeted optimizations (buffer reuse, batched CONNECT writes, eliminate inter-layer copies) — NOT done. Current speed comes from inherited keep-alive pooling, not new optimization work.
-- [ ] 6.5 Certify ≥20% over libcurl on the primary metric — NOT formally certified on representative hardware. The harness shows ylong **+41.5%** over libcurl on this shared sandbox under a strict HTTP/1.1, keep-alive, same-proxy comparison (ylong additionally verifies the proxy cert while curl skips it). This comfortably clears the 20% target *here*, but the official certification must still be run on representative hardware. (See `benchmark-results.md`.)
+- [x] 6.5 Certify ≥20% over libcurl on the primary metric — **MET on representative RISC-V hardware** (SpacemiT K3, 8-core riscv64, Bianbu 4.0, rustc 1.96 stable). Five consecutive runs: ylong ~4,350 req/s vs libcurl ~3,200 req/s = **+25.9%…+26.9% (median +26.4%)**, same system OpenSSL on both. Also +41.5% on the x86 sandbox. (See `benchmark-results.md`.)
 - [ ] 6.6 Re-run section 5 tests after optimization to confirm no regression — pending 6.4/6.5.
 
 ## 7. Validation and docs
