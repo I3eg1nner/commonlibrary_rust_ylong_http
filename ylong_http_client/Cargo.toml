@@ -18,6 +18,8 @@ ylong_runtime = { git = "https://gitcode.com/openharmony/commonlibrary_rust_ylon
 hyper = { version = "0.14.23", features = ["http1", "http2", "tcp", "server"] }
 openssl = { version = "0.10.29" }
 tokio-openssl = { version = "0.6.3" }
+# 用于基准:直接链接 libcurl(库),与 ylong 做库对库的性能对比
+curl = { version = "0.4" }
 
 [features]
 default = []

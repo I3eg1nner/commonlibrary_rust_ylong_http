@@ -245,6 +245,42 @@ fn bench_curl(proxy_addr: &str, origin_url: &str) -> Option<f64> {
     }
 }
 
+/// Measures **libcurl (the library)** over the same HTTPS proxy, driven in-process
+/// via the `curl` crate's easy interface. A single `Easy` handle is reused across
+/// all requests, so libcurl reuses the connection and proxy tunnel (keep-alive),
+/// matching ylong. This is the true library-vs-library comparison (no `curl` CLI
+/// process / argument-parsing overhead).
+///
+/// TLS verification is configured to match ylong exactly: both the proxy and the
+/// origin certificate are verified against the test root CA, with hostname
+/// verification disabled (the fixture cert's CN is not `127.0.0.1`).
+fn bench_libcurl(proxy_addr: &str, origin_url: &str) -> Option<f64> {
+    use curl::easy::{Easy, HttpVersion};
+
+    let ca = file("root-ca.pem");
+    let mut h = Easy::new();
+    h.url(origin_url).ok()?;
+    h.proxy(&format!("https://{proxy_addr}")).ok()?;
+    h.proxy_cainfo(&ca).ok()?;
+    h.proxy_ssl_verify_peer(true).ok()?;
+    h.proxy_ssl_verify_host(false).ok()?;
+    h.cainfo(&ca).ok()?;
+    h.ssl_verify_peer(true).ok()?;
+    h.ssl_verify_host(false).ok()?;
+    h.http_version(HttpVersion::V11).ok()?;
+    h.write_function(|data| Ok(data.len())).ok()?;
+
+    // Warm-up (establishes the proxy TLS tunnel + origin TLS once; reused after).
+    for _ in 0..WARMUP {
+        h.perform().ok()?;
+    }
+    let start = Instant::now();
+    for _ in 0..REQUESTS {
+        h.perform().ok()?;
+    }
+    Some(start.elapsed().as_secs_f64())
+}
+
 fn main() {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
@@ -271,33 +307,35 @@ fn main() {
         );
         println!("proxy=https://{proxy_addr}  origin={origin_url}");
 
-        let ylong_secs = bench_ylong(proxy_addr.to_string(), origin_url.clone()).await;
-        let ylong_rps = REQUESTS as f64 / ylong_secs;
-        println!(
-            "ylong_http_client: {:.3}s  ({:.0} req/s, {:.3} ms/req)",
-            ylong_secs,
-            ylong_rps,
-            ylong_secs * 1000.0 / REQUESTS as f64
-        );
+        let line = |label: &str, secs: f64| {
+            println!(
+                "{label:<22}{secs:.3}s  ({:.0} req/s, {:.3} ms/req)",
+                REQUESTS as f64 / secs,
+                secs * 1000.0 / REQUESTS as f64
+            );
+        };
 
-        match bench_curl(&proxy_addr.to_string(), &origin_url) {
-            Some(curl_secs) => {
-                let curl_rps = REQUESTS as f64 / curl_secs;
-                println!(
-                    "libcurl:           {:.3}s  ({:.0} req/s, {:.3} ms/req)",
-                    curl_secs,
-                    curl_rps,
-                    curl_secs * 1000.0 / REQUESTS as f64
-                );
-                let improvement = (curl_secs - ylong_secs) / curl_secs * 100.0;
+        let ylong_secs = bench_ylong(proxy_addr.to_string(), origin_url.clone()).await;
+        line("ylong_http_client:", ylong_secs);
+
+        // PRIMARY: ylong (library) vs libcurl (library), in-process, apples-to-apples.
+        match bench_libcurl(&proxy_addr.to_string(), &origin_url) {
+            Some(lib_secs) => {
+                line("libcurl (library):", lib_secs);
+                let improvement = (lib_secs - ylong_secs) / lib_secs * 100.0;
                 println!("ylong vs libcurl (throughput): {improvement:+.1}%");
-                println!(
-                    "NOTE: indicative only on this host. Re-run on representative hardware to certify the >=20% target."
-                );
             }
-            None => {
-                println!("libcurl: SKIPPED (curl unavailable or HTTPS-proxy unsupported).");
-            }
+            None => println!("libcurl (library): SKIPPED (curl crate / libcurl unavailable)."),
         }
+
+        // REFERENCE ONLY: the `curl` CLI tool (includes process / CLI overhead);
+        // not the library comparison the target is about.
+        if let Some(cli_secs) = bench_curl(&proxy_addr.to_string(), &origin_url) {
+            line("curl CLI (ref only):", cli_secs);
+        }
+
+        println!(
+            "NOTE: indicative only on this host. Re-run on representative hardware to certify the >=20% target."
+        );
     });
 }

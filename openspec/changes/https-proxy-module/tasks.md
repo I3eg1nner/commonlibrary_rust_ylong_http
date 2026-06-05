@@ -47,11 +47,11 @@
 ## 6. Performance: benchmark and optimization
 
 - [x] 6.1 Build a reproducible HTTPS-proxy benchmark — `benches/https_proxy_bench.rs` (`harness = false`): TLS proxy + TLS origin fixtures, fixed documented config (requests/warmup/payload, keep-alive sequential).
-- [x] 6.2 Add a libcurl baseline under the identical scenario — `bench_curl` drives the system `curl` through the same HTTPS proxy, reusing one tunnel and forced to `--http1.1` for a strict apples-to-apples comparison; skips gracefully if curl is unavailable/unsupported.
-- [x] 6.3 Capture baseline metrics for both clients — the bench prints req/s and ms/req for both and the throughput delta.
-- [ ] 6.4 Apply targeted optimizations (buffer reuse, batched CONNECT writes, eliminate inter-layer copies) — NOT done. Current speed comes from inherited keep-alive pooling, not new optimization work.
-- [x] 6.5 Certify ≥20% over libcurl on the primary metric — **MET on representative RISC-V hardware** (SpacemiT K3, 8-core riscv64, Bianbu 4.0, rustc 1.96 stable). Five consecutive runs: ylong ~4,350 req/s vs libcurl ~3,200 req/s = **+25.9%…+26.9% (median +26.4%)**, same system OpenSSL on both. Also +41.5% on the x86 sandbox. (See `benchmark-results.md`.)
-- [ ] 6.6 Re-run section 5 tests after optimization to confirm no regression — pending 6.4/6.5.
+- [x] 6.2 libcurl baseline — **two baselines** in `benches/https_proxy_bench.rs`: (a) **libcurl the library** via the `curl` crate, in-process, one reused `Easy` handle (keep-alive), same system OpenSSL, identical TLS verification — this is the correct library-vs-library comparison; (b) the `curl` CLI as a reference-only line.
+- [x] 6.3 Capture metrics for both clients — bench prints ylong, libcurl(library), and curl(CLI) req/s + the library delta.
+- [ ] 6.4 Apply targeted optimizations (buffer reuse, batched CONNECT writes, eliminate inter-layer copies) — NOT done. Current speed is from inherited keep-alive pooling.
+- [ ] 6.5 Certify ≥20% over **libcurl (the library)** — **NOT MET.** RISC-V (SpacemiT K3, rustc 1.96, same system OpenSSL), 5 runs: ylong ~4,310 vs libcurl-library ~4,237 req/s = **≈ +1.5% (range +0.6%…+2.2%)** — essentially on par, far below 20%. The earlier "+26% / +41.5%" were vs the `curl` **CLI** (process/CLI overhead), not the library, and do not represent a real advantage. Both clients are OpenSSL-bound on the same TLS-in-TLS path. (See `benchmark-results.md`.)
+- [ ] 6.6 Re-run section 5 tests after optimization to confirm no regression — pending 6.4.
 
 ## 7. Validation and docs
 

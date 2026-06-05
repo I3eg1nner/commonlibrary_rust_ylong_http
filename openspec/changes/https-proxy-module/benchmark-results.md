@@ -38,57 +38,65 @@ cargo bench --no-default-features \
   --bench https_proxy_bench
 ```
 
-## Results
+## Important: two different baselines
 
-### Indicative run (shared development sandbox — NOT representative)
+The sub-task asks to compare against **libcurl (the library)**. There are two very
+different things one can measure, and they give very different numbers:
 
-| Client | Time (2000 req) | Throughput | Latency |
-|--------|-----------------|-----------|---------|
-| ylong_http_client | 0.159 s | 12,616 req/s | 0.079 ms/req |
-| libcurl (`--http1.1`) | 0.271 s | 7,385 req/s | 0.135 ms/req |
-| **Δ throughput** | | **+41.5%** | |
+1. **libcurl (library)** — link libcurl into the benchmark (via the `curl` crate's
+   easy interface) and drive it in-process with a reused handle. This is the
+   apples-to-apples *library-vs-library* comparison the target is about.
+2. **`curl` CLI** — shell out to the `curl` command-line tool. Even when one curl
+   process is reused for all requests, this still carries the CLI's per-URL
+   transfer setup / argument handling overhead. It is **not** a library
+   comparison and inflates ylong's apparent advantage.
 
-> ⚠️ Measured on a shared sandbox. The `curl` leg reuses a single process/tunnel
-> for all 2000 requests (so process startup is amortized) and is pinned to
-> HTTP/1.1 to match ylong. The result clears the ≥20% target *here* and the
-> comparison is conservative (ylong verifies the proxy cert; curl does not), but
-> a shared host is still **not** a valid environment to formally certify the
-> criterion — re-run on representative hardware.
+The benchmark now measures **(1) as the primary result** and prints (2) for
+reference only. TLS verification is configured identically for both ylong and
+libcurl: proxy and origin certificates are verified against the test root CA,
+hostname verification disabled.
 
-### Certification on representative hardware — RISC-V (SpacemiT K3) — ✅ MEETS ≥20%
-
-Run natively on a RISC-V development board, which is representative of
-OpenHarmony targets:
+## Results — RISC-V (SpacemiT K3), representative hardware
 
 - **Hardware**: SpacemiT K3, RISC-V64 (`riscv64gc`), 8 cores, 7.7 GB RAM
-- **OS**: Bianbu 4.0 (Ubuntu-based)
-- **Toolchain**: rustc 1.96.0 stable, `bench` profile (optimized)
-- **OpenSSL**: system OpenSSL 3.5 (same library linked by both `ylong` and `curl 8.18`, so the comparison is fair)
-- Same fixed configuration as above (2000 req, 200 warm-up, 1 KB, keep-alive, HTTP/1.1).
+- **OS**: Bianbu 4.0 (Ubuntu-based); **Toolchain**: rustc 1.96.0 stable, `bench` profile
+- **OpenSSL**: system OpenSSL 3.5 — **the same library linked by both** ylong and libcurl 8.18
+- Config: 2000 req, 200 warm-up, 1 KB payload, keep-alive (reused connection/tunnel), HTTP/1.1
 
 Five consecutive runs (very low variance):
 
-| Run | ylong req/s | libcurl req/s | Δ throughput |
-|-----|-------------|---------------|--------------|
-| 1 | 4,278 | 3,172 | +25.9% |
-| 2 | 4,353 | 3,203 | +26.4% |
-| 3 | 4,376 | 3,199 | +26.9% |
-| 4 | 4,355 | 3,217 | +26.1% |
-| 5 | 4,339 | 3,192 | +26.4% |
-| **median** | **~4,350** | **~3,200** | **+26.4%** (range 25.9–26.9%) |
+| Run | ylong req/s | **libcurl (library) req/s** | **Δ (vs library)** | curl CLI req/s (ref) |
+|-----|-------------|------------------------------|---------------------|----------------------|
+| 1 | 4,199 | 4,137 | +1.5% | 3,216 |
+| 2 | 4,328 | 4,299 | +0.6% | 3,229 |
+| 3 | 4,310 | 4,249 | +1.4% | 3,254 |
+| 4 | 4,254 | 4,177 | +1.8% | 3,019 |
+| 5 | 4,333 | 4,237 | +2.2% | 3,207 |
+| **median** | **~4,310** | **~4,237** | **≈ +1.5%** (range +0.6%…+2.2%) | ~3,210 |
 
-**Conclusion:** on representative RISC-V hardware, `ylong_http_client` is
-consistently **~26% faster** than `libcurl` in the HTTPS-proxy scenario,
-comfortably and reproducibly clearing the **≥20%** target.
+## Conclusion — honest assessment
 
-> Note: this still uses the `curl` CLI (one process reused across all 2000
-> requests, so startup is amortized). The margin is smaller than on the x86
-> sandbox (+41.5%), as expected for different CPU characteristics, but the target
-> is met on both.
+- **Against libcurl (the library): `ylong_http_client` is essentially on par,
+  ~1–2% faster (median ≈ +1.5%).** It does **NOT** reach the ≥20% target in the
+  rigorous library-vs-library sense. Both clients are OpenSSL-bound on the same
+  TLS-in-TLS path, so a large gap is not expected.
+- The earlier **+26% (RISC-V) / +41.5% (x86)** figures were measured against the
+  **`curl` CLI tool**, whose process/CLI overhead accounts for almost the entire
+  difference (libcurl-the-library is ~30% faster than its own CLI here). Those
+  numbers do **not** represent a real library performance advantage and are kept
+  only as a CLI reference (ylong is ~+26% faster than the curl CLI on RISC-V).
 
-## Notes
+**Net:** the HTTPS-proxy feature performs at parity with a mature C library
+(libcurl) — a respectable result — but the "≥20% over libcurl" goal is **not met**
+under a fair library-to-library comparison.
 
-- The current ylong performance benefits from the existing connection pool
-  (keep-alive amortizes the proxy TLS handshake). No HTTPS-proxy-specific
-  micro-optimizations (buffer reuse, batched CONNECT writes, inter-layer copy
-  elimination — task 6.4) have been applied yet; those remain available headroom.
+## Notes / headroom
+
+- ylong's speed comes from the existing connection pool (keep-alive amortizes the
+  proxy TLS handshake). No HTTPS-proxy-specific micro-optimizations (buffer reuse,
+  batched CONNECT writes, inter-layer copy elimination — task 6.4) have been
+  applied; those are the remaining headroom if the ≥20%-over-libcurl goal is to be
+  pursued, though beating a mature C library by 20% on an OpenSSL-bound path is
+  ambitious.
+- The x86-sandbox numbers were CLI-based and are superseded by this
+  library-vs-library measurement; they are not a valid basis for the target.
