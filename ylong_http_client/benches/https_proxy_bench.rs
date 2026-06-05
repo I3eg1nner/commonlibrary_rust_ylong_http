@@ -50,13 +50,33 @@ use ylong_http::body::async_impl::Body as _;
 use ylong_http_client::async_impl::{Body, ClientBuilder, Request};
 use ylong_http_client::{Proxy, TlsConfig};
 
-// ---- Fixed, documented benchmark configuration -----------------------------
-/// Number of measured requests (sequential, keep-alive reused connection).
-const REQUESTS: usize = 2_000;
-/// Number of warm-up requests excluded from measurement.
-const WARMUP: usize = 200;
-/// Response payload size in bytes.
-const PAYLOAD: usize = 1_024;
+// ---- Benchmark configuration (env-overridable for parameter sweeps) ---------
+// BENCH_REQUESTS (default 2000), BENCH_WARMUP (200), BENCH_PAYLOAD bytes (1024),
+// BENCH_KEEPALIVE (1=reuse connection/tunnel, 0=new connection per request).
+#[derive(Clone, Copy)]
+struct Cfg {
+    requests: usize,
+    warmup: usize,
+    payload: usize,
+    keepalive: bool,
+}
+
+fn cfg() -> Cfg {
+    let g = |k: &str, d: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    Cfg {
+        requests: g("BENCH_REQUESTS", 2000),
+        warmup: g("BENCH_WARMUP", 200),
+        payload: g("BENCH_PAYLOAD", 1024),
+        keepalive: std::env::var("BENCH_KEEPALIVE")
+            .map(|v| v != "0")
+            .unwrap_or(true),
+    }
+}
 // ----------------------------------------------------------------------------
 
 fn file(name: &str) -> String {
@@ -79,7 +99,7 @@ fn tls_acceptor() -> Arc<SslAcceptor> {
 
 /// Loop-accepting origin HTTPS server; replies with a fixed-size payload and
 /// keep-alive so a single connection serves many requests.
-async fn serve_origin(listener: TcpListener, acceptor: Arc<SslAcceptor>) {
+async fn serve_origin(listener: TcpListener, acceptor: Arc<SslAcceptor>, payload: usize) {
     loop {
         let (stream, _) = match listener.accept().await {
             Ok(v) => v,
@@ -97,12 +117,12 @@ async fn serve_origin(listener: TcpListener, acceptor: Arc<SslAcceptor>) {
                 .http1_keep_alive(true)
                 .serve_connection(
                     stream,
-                    hyper::service::service_fn(|_req| async {
-                        let body = vec![b'a'; PAYLOAD];
+                    hyper::service::service_fn(move |_req| async move {
+                        let body = vec![b'a'; payload];
                         Ok::<_, std::convert::Infallible>(
                             hyper::Response::builder()
                                 .status(200)
-                                .header("Content-Length", PAYLOAD.to_string())
+                                .header("Content-Length", payload.to_string())
                                 .body(hyper::Body::from(body))
                                 .unwrap(),
                         )
@@ -163,15 +183,14 @@ async fn serve_proxy(listener: TcpListener, acceptor: Arc<SslAcceptor>) {
     }
 }
 
-/// Measures `ylong_http_client` over the HTTPS proxy. Returns elapsed seconds
-/// for `REQUESTS` measured requests.
-async fn bench_ylong(proxy_addr: String, origin_url: String) -> f64 {
+/// Builds a fresh ylong client configured for the HTTPS proxy.
+fn ylong_client(proxy_addr: &str) -> ylong_http_client::async_impl::Client {
     let proxy_tls = TlsConfig::builder()
         .ca_file(file("root-ca.pem"))
         .danger_accept_invalid_hostnames(true)
         .build()
         .unwrap();
-    let client = ClientBuilder::new()
+    ClientBuilder::new()
         .tls_ca_file(&file("root-ca.pem"))
         .danger_accept_invalid_hostnames(true)
         .proxy(
@@ -181,55 +200,71 @@ async fn bench_ylong(proxy_addr: String, origin_url: String) -> f64 {
                 .unwrap(),
         )
         .build()
-        .unwrap();
-
-    async fn run_once(client: &ylong_http_client::async_impl::Client, url: &str) {
-        let req = Request::builder()
-            .method("GET")
-            .url(url)
-            .body(Body::empty())
-            .unwrap();
-        let mut resp = client.request(req).await.expect("ylong request failed");
-        let mut buf = [0u8; 4096];
-        while resp.body_mut().data(&mut buf).await.unwrap() != 0 {}
-    }
-
-    for _ in 0..WARMUP {
-        run_once(&client, &origin_url).await;
-    }
-    let start = Instant::now();
-    for _ in 0..REQUESTS {
-        run_once(&client, &origin_url).await;
-    }
-    start.elapsed().as_secs_f64()
+        .unwrap()
 }
 
-/// Measures `libcurl` (via the `curl` binary) over the same HTTPS proxy by
-/// reusing a single tunnel for all requests. Returns elapsed seconds, or `None`
-/// if curl is unavailable / unsupported.
-fn bench_curl(proxy_addr: &str, origin_url: &str) -> Option<f64> {
-    // Probe: does this curl support an HTTPS proxy at all?
+async fn ylong_once(client: &ylong_http_client::async_impl::Client, url: &str) {
+    let req = Request::builder()
+        .method("GET")
+        .url(url)
+        .body(Body::empty())
+        .unwrap();
+    let mut resp = client.request(req).await.expect("ylong request failed");
+    let mut buf = [0u8; 16384];
+    while resp.body_mut().data(&mut buf).await.unwrap() != 0 {}
+}
+
+/// Measures `ylong_http_client` over the HTTPS proxy. With `cfg.keepalive` the
+/// connection/tunnel is reused (one client); otherwise a fresh client (hence a
+/// fresh proxy TLS tunnel + origin handshake) is used for every request, which
+/// isolates the connection-establishment cost.
+async fn bench_ylong(cfg: Cfg, proxy_addr: String, origin_url: String) -> f64 {
+    if cfg.keepalive {
+        let client = ylong_client(&proxy_addr);
+        for _ in 0..cfg.warmup {
+            ylong_once(&client, &origin_url).await;
+        }
+        let start = Instant::now();
+        for _ in 0..cfg.requests {
+            ylong_once(&client, &origin_url).await;
+        }
+        start.elapsed().as_secs_f64()
+    } else {
+        for _ in 0..cfg.warmup {
+            let client = ylong_client(&proxy_addr);
+            ylong_once(&client, &origin_url).await;
+        }
+        let start = Instant::now();
+        for _ in 0..cfg.requests {
+            let client = ylong_client(&proxy_addr);
+            ylong_once(&client, &origin_url).await;
+        }
+        start.elapsed().as_secs_f64()
+    }
+}
+
+/// Measures the `curl` CLI tool (reference only — includes process/CLI overhead,
+/// not a library comparison). Only meaningful with keep-alive (one process reuses
+/// one tunnel across all URLs); returns `None` otherwise or if curl is missing.
+fn bench_curl(cfg: Cfg, proxy_addr: &str, origin_url: &str) -> Option<f64> {
+    if !cfg.keepalive {
+        return None;
+    }
     let probe = Command::new("curl").arg("--version").output().ok()?;
     if !probe.status.success() {
         return None;
     }
-
     let mut args: Vec<String> = vec![
         "-s".into(),
-        // Match ylong's protocol exactly (HTTP/1.1 to the origin) for a fair
-        // comparison; the origin server is HTTP/1.1-only anyway.
         "--http1.1".into(),
         "--proxy".into(),
         format!("https://{proxy_addr}"),
         "--proxy-insecure".into(),
         "--insecure".into(),
     ];
-    // Repeat the URL so a single curl process reuses one proxy tunnel,
-    // matching ylong's keep-alive behaviour.
-    for _ in 0..REQUESTS {
+    for _ in 0..cfg.requests {
         args.push(origin_url.into());
     }
-
     let start = Instant::now();
     let status = Command::new("curl")
         .args(&args)
@@ -238,23 +273,18 @@ fn bench_curl(proxy_addr: &str, origin_url: &str) -> Option<f64> {
         .status()
         .ok()?;
     let elapsed = start.elapsed().as_secs_f64();
-    if status.success() {
-        Some(elapsed)
-    } else {
-        None
-    }
+    status.success().then_some(elapsed)
 }
 
 /// Measures **libcurl (the library)** over the same HTTPS proxy, driven in-process
-/// via the `curl` crate's easy interface. A single `Easy` handle is reused across
-/// all requests, so libcurl reuses the connection and proxy tunnel (keep-alive),
-/// matching ylong. This is the true library-vs-library comparison (no `curl` CLI
-/// process / argument-parsing overhead).
+/// via the `curl` crate's easy interface — the true library-vs-library comparison
+/// (no `curl` CLI process / argument-parsing overhead). With `cfg.keepalive` a
+/// single `Easy` handle reuses the connection/tunnel; otherwise each request forces
+/// a fresh connection (`fresh_connect` + `forbid_reuse`), isolating setup cost.
 ///
-/// TLS verification is configured to match ylong exactly: both the proxy and the
-/// origin certificate are verified against the test root CA, with hostname
-/// verification disabled (the fixture cert's CN is not `127.0.0.1`).
-fn bench_libcurl(proxy_addr: &str, origin_url: &str) -> Option<f64> {
+/// TLS verification matches ylong exactly: proxy and origin certs verified against
+/// the test root CA, hostname verification disabled.
+fn bench_libcurl(cfg: Cfg, proxy_addr: &str, origin_url: &str) -> Option<f64> {
     use curl::easy::{Easy, HttpVersion};
 
     let ca = file("root-ca.pem");
@@ -268,20 +298,24 @@ fn bench_libcurl(proxy_addr: &str, origin_url: &str) -> Option<f64> {
     h.ssl_verify_peer(true).ok()?;
     h.ssl_verify_host(false).ok()?;
     h.http_version(HttpVersion::V11).ok()?;
+    if !cfg.keepalive {
+        h.fresh_connect(true).ok()?;
+        h.forbid_reuse(true).ok()?;
+    }
     h.write_function(|data| Ok(data.len())).ok()?;
 
-    // Warm-up (establishes the proxy TLS tunnel + origin TLS once; reused after).
-    for _ in 0..WARMUP {
+    for _ in 0..cfg.warmup {
         h.perform().ok()?;
     }
     let start = Instant::now();
-    for _ in 0..REQUESTS {
+    for _ in 0..cfg.requests {
         h.perform().ok()?;
     }
     Some(start.elapsed().as_secs_f64())
 }
 
 fn main() {
+    let cfg = cfg();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -293,7 +327,7 @@ fn main() {
 
         let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin_addr = origin_listener.local_addr().unwrap();
-        tokio::spawn(serve_origin(origin_listener, acceptor.clone()));
+        tokio::spawn(serve_origin(origin_listener, acceptor.clone(), cfg.payload));
 
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
@@ -303,23 +337,24 @@ fn main() {
 
         println!("== HTTPS-proxy benchmark ==");
         println!(
-            "config: requests={REQUESTS} warmup={WARMUP} payload={PAYLOAD}B keep-alive=on (sequential)"
+            "config: requests={} warmup={} payload={}B keep-alive={}",
+            cfg.requests, cfg.warmup, cfg.payload, if cfg.keepalive { "on" } else { "off" }
         );
-        println!("proxy=https://{proxy_addr}  origin={origin_url}");
 
+        let reqs = cfg.requests as f64;
         let line = |label: &str, secs: f64| {
             println!(
                 "{label:<22}{secs:.3}s  ({:.0} req/s, {:.3} ms/req)",
-                REQUESTS as f64 / secs,
-                secs * 1000.0 / REQUESTS as f64
+                reqs / secs,
+                secs * 1000.0 / reqs
             );
         };
 
-        let ylong_secs = bench_ylong(proxy_addr.to_string(), origin_url.clone()).await;
+        let ylong_secs = bench_ylong(cfg, proxy_addr.to_string(), origin_url.clone()).await;
         line("ylong_http_client:", ylong_secs);
 
         // PRIMARY: ylong (library) vs libcurl (library), in-process, apples-to-apples.
-        match bench_libcurl(&proxy_addr.to_string(), &origin_url) {
+        match bench_libcurl(cfg, &proxy_addr.to_string(), &origin_url) {
             Some(lib_secs) => {
                 line("libcurl (library):", lib_secs);
                 let improvement = (lib_secs - ylong_secs) / lib_secs * 100.0;
@@ -328,14 +363,11 @@ fn main() {
             None => println!("libcurl (library): SKIPPED (curl crate / libcurl unavailable)."),
         }
 
-        // REFERENCE ONLY: the `curl` CLI tool (includes process / CLI overhead);
-        // not the library comparison the target is about.
-        if let Some(cli_secs) = bench_curl(&proxy_addr.to_string(), &origin_url) {
+        // REFERENCE ONLY: the `curl` CLI tool (process/CLI overhead, keep-alive only).
+        if let Some(cli_secs) = bench_curl(cfg, &proxy_addr.to_string(), &origin_url) {
             line("curl CLI (ref only):", cli_secs);
         }
 
-        println!(
-            "NOTE: indicative only on this host. Re-run on representative hardware to certify the >=20% target."
-        );
+        println!("NOTE: indicative only on this host (parameter sweep via BENCH_* env).");
     });
 }

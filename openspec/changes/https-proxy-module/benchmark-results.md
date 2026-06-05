@@ -90,6 +90,32 @@ Five consecutive runs (very low variance):
 (libcurl) — a respectable result — but the "≥20% over libcurl" goal is **not met**
 under a fair library-to-library comparison.
 
+## Fine-grained analysis (ylong vs libcurl library, RISC-V)
+
+Parameter sweep via `BENCH_KEEPALIVE` / `BENCH_PAYLOAD` / `BENCH_REQUESTS`:
+
+| Scenario | ylong | libcurl (lib) | Δ | Reading |
+|----------|-------|---------------|---|---------|
+| keep-alive, payload 0 B | 4551 req/s | 4454 req/s | **+2.1%** | steady-state small request → ylong slightly ahead |
+| keep-alive, payload 1 KB | 4310 | 4237 | +1.5% | same |
+| keep-alive, payload 16 KB | 23 | 23 | ~0% | both stalled ~44 ms — fixture Nagle/delayed-ACK artifact (no `TCP_NODELAY` on the test server/proxy side); not informative |
+| keep-alive, payload 256 KB | 239 | 291 | **−21.6%** | large body → ylong slower (read/copy efficiency through nested TLS layers) |
+| **no keep-alive**, 1 KB | 16 | 22 | **−40.7%** | cold connection setup (proxy TLS + CONNECT + origin TLS) → ylong slower |
+
+**Where ylong wins:** steady-state, small messages, reused connection (the common
+long-lived-proxy case) — on par with or slightly faster (+2%) than libcurl.
+
+**Where ylong loses:**
+1. **Cold connection setup (−40%)** — full TLS handshakes every time; libcurl reuses
+   TLS sessions (abbreviated handshake). (Note: this bench rebuilds the ylong client
+   — incl. CA load + `SSL_CTX` — per request, so −40% is an upper bound.)
+2. **Large-body throughput (−22%)** — more copies / smaller reads across
+   `ProxyTunnel → AsyncSslStream → MixStream → body reader` than libcurl.
+
+These two map directly to the refined optimization plan (tasks 6.4a–6.4d):
+TLS session resumption (cold-connect), larger/zero-copy body reads (large-body),
+CONNECT buffer reuse, and `TCP_NODELAY` on the tunnel.
+
 ## Notes / headroom
 
 - ylong's speed comes from the existing connection pool (keep-alive amortizes the
