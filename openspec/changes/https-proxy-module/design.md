@@ -104,4 +104,4 @@ Rollback: each step is additive/behavior-preserving; reverting steps 3–5 leave
 
 - Should an `https://` proxy URL alone imply TLS-to-proxy, or must a proxy TLS config be explicitly set? (Proposed: scheme implies it; config refines it.)
 - Do we need HTTP/2 CONNECT (extended CONNECT) to the proxy, or is HTTP/1.1 CONNECT sufficient for the tunnel? (Proposed: HTTP/1.1 CONNECT for the tunnel hop, independent of origin HTTP version.)
-- Exact benchmark workload to certify the 20% figure (payload size, concurrency level) — to be fixed in the performance tasks.
+- ~~Exact benchmark workload to certify the 20% figure (payload size, concurrency level) — to be fixed in the performance tasks.~~ **Resolved:** the ≥20% figure is certified in the high-concurrency / CPU-constrained scenario — client pinned to a single core, K concurrent keep-alive connections (K = 50…1000), 1 KB payload, ylong on a current-thread runtime vs libcurl thread-per-connection. Single-connection is parity. Full config in `benchmark-results.md` and tasks 6.7/6.8.

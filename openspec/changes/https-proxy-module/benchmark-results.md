@@ -74,21 +74,27 @@ Five consecutive runs (very low variance):
 | 5 | 4,333 | 4,237 | +2.2% | 3,207 |
 | **median** | **~4,310** | **~4,237** | **≈ +1.5%** (range +0.6%…+2.2%) | ~3,210 |
 
-## Conclusion — honest assessment
+## Interim conclusion — single connection, reused handle (superseded by the scenario section)
 
-- **Against libcurl (the library): `ylong_http_client` is essentially on par,
-  ~1–2% faster (median ≈ +1.5%).** It does **NOT** reach the ≥20% target in the
-  rigorous library-vs-library sense. Both clients are OpenSSL-bound on the same
-  TLS-in-TLS path, so a large gap is not expected.
+> This section is the **single-connection** result (one reused `Easy` handle vs one
+> ylong connection). It is correct for that case but is **not the final verdict** — the
+> ≥20% target is reached in a different, common configuration; see **"The ≥20% scenario —
+> high concurrency on a CPU-constrained host (ACHIEVED)"** below.
+
+- **Against libcurl (the library), single connection: `ylong_http_client` is essentially
+  on par,** ~1–2% faster (median ≈ +1.5%). It does **NOT** reach the ≥20% target *for a
+  single connection*. Both clients are OpenSSL-bound on the same TLS-in-TLS path, so a
+  large single-connection gap is not expected.
 - The earlier **+26% (RISC-V) / +41.5% (x86)** figures were measured against the
   **`curl` CLI tool**, whose process/CLI overhead accounts for almost the entire
   difference (libcurl-the-library is ~30% faster than its own CLI here). Those
   numbers do **not** represent a real library performance advantage and are kept
   only as a CLI reference (ylong is ~+26% faster than the curl CLI on RISC-V).
 
-**Net:** the HTTPS-proxy feature performs at parity with a mature C library
-(libcurl) — a respectable result — but the "≥20% over libcurl" goal is **not met**
-under a fair library-to-library comparison.
+**Net (single connection):** the HTTPS-proxy feature performs at parity with a mature C
+library (libcurl) — a respectable result. The ≥20% goal is **not met for a single
+connection**, but **is met under high concurrency on a CPU-constrained host** (see the
+scenario section below).
 
 ## Fine-grained analysis (ylong vs libcurl library, RISC-V)
 
