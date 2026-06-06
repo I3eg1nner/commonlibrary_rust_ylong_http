@@ -87,9 +87,23 @@ pub trait Interceptor {
     ) -> Result<(), HttpClientError> {
         Ok(())
     }
+
+    /// Returns `true` if this interceptor does nothing, allowing hot I/O paths
+    /// to skip the indirect (vtable) calls to `intercept_input` /
+    /// `intercept_output` on every chunk. Defaults to `false` so custom
+    /// interceptors are always invoked.
+    #[inline]
+    fn is_noop(&self) -> bool {
+        false
+    }
 }
 
 /// The default Interceptor does not do any intercepting.
 pub(crate) struct IdleInterceptor;
 
-impl Interceptor for IdleInterceptor {}
+impl Interceptor for IdleInterceptor {
+    #[inline]
+    fn is_noop(&self) -> bool {
+        true
+    }
+}

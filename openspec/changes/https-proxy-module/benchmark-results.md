@@ -92,37 +92,73 @@ under a fair library-to-library comparison.
 
 ## Fine-grained analysis (ylong vs libcurl library, RISC-V)
 
-Parameter sweep via `BENCH_KEEPALIVE` / `BENCH_PAYLOAD` / `BENCH_REQUESTS`:
+Parameter sweep via `BENCH_KEEPALIVE` / `BENCH_PAYLOAD` / `BENCH_REQUESTS` (before optimization, clean nodelay fixture):
 
-| Scenario | ylong | libcurl (lib) | Δ | Reading |
-|----------|-------|---------------|---|---------|
-| keep-alive, payload 0 B | 4551 req/s | 4454 req/s | **+2.1%** | steady-state small request → ylong slightly ahead |
-| keep-alive, payload 1 KB | 4310 | 4237 | +1.5% | same |
-| keep-alive, payload 16 KB | 23 | 23 | ~0% | both stalled ~44 ms — fixture Nagle/delayed-ACK artifact (no `TCP_NODELAY` on the test server/proxy side); not informative |
-| keep-alive, payload 256 KB | 239 | 291 | **−21.6%** | large body → ylong slower (read/copy efficiency through nested TLS layers) |
-| **no keep-alive**, 1 KB | 16 | 22 | **−40.7%** | cold connection setup (proxy TLS + CONNECT + origin TLS) → ylong slower |
+| Scenario | Δ (ylong vs libcurl lib) | Reading |
+|----------|--------------------------|---------|
+| keep-alive, payload 0 B | +2% | steady-state small request → ~parity / slight win |
+| keep-alive, payload 1 KB | +1.5% | same |
+| keep-alive, payload 256 KB | **−35%** | large body → ylong slower (data-path through nested TLS) |
+| no keep-alive, 1 KB | slower | cold setup (full handshakes); also dominated by per-request client rebuild in the bench |
 
-**Where ylong wins:** steady-state, small messages, reused connection (the common
-long-lived-proxy case) — on par with or slightly faster (+2%) than libcurl.
+**Where ylong wins:** steady-state small messages on a reused connection — parity / +2%.
+**Where ylong loses:** large bodies (−35%) and connection setup.
 
-**Where ylong loses:**
-1. **Cold connection setup (−40%)** — full TLS handshakes every time; libcurl reuses
-   TLS sessions (abbreviated handshake). (Note: this bench rebuilds the ylong client
-   — incl. CA load + `SSL_CTX` — per request, so −40% is an upper bound.)
-2. **Large-body throughput (−22%)** — more copies / smaller reads across
-   `ProxyTunnel → AsyncSslStream → MixStream → body reader` than libcurl.
+## Optimization attempts (task 6.4) — what worked and what didn't
 
-These two map directly to the refined optimization plan (tasks 6.4a–6.4d):
-TLS session resumption (cold-connect), larger/zero-copy body reads (large-body),
-CONNECT buffer reuse, and `TCP_NODELAY` on the tunnel.
+Implemented and measured on the board:
 
-## Notes / headroom
+- **6.4a TLS session resumption** (OpenSSL session cache, per-`SSL_CTX` keyed, gated off for pinned/custom-verifier configs for safety): correct + secure, but the bench can't demonstrate it (its no-keepalive mode rebuilds the client/`SSL_CTX` per request, so the per-ctx cache never hits). Helps real "one long-lived client, repeated cold connections to the same host" only.
+- **6.4b read-drain loop**: **REVERTED** — measured a ~3% *regression* on large bodies, no benefit (`SSL_read` returns one record per call regardless).
+- **Phase-1 larger read buffer (16KB→64KB) + `SSL_set_read_ahead` + `SSL_MODE_RELEASE_BUFFERS` + per-request hot-path cuts** (skip no-op interceptor vtable calls, gate the speed-controller): **no measurable effect on the large-body gap** — 256 KB stayed at −35%. This **falsifies the "read-overhead/buffer-size" hypothesis**: `SSL_read` caps at one ~16 KB record per call, so a bigger caller buffer doesn't reduce the call count, and reducing it (6.4b) didn't help. The gap is **throughput/data-path bound, not call-overhead bound**. (These changes are correctness-neutral and low-risk; kept as hygiene.)
 
-- ylong's speed comes from the existing connection pool (keep-alive amortizes the
-  proxy TLS handshake). No HTTPS-proxy-specific micro-optimizations (buffer reuse,
-  batched CONNECT writes, inter-layer copy elimination — task 6.4) have been
-  applied; those are the remaining headroom if the ≥20%-over-libcurl goal is to be
-  pursued, though beating a mature C library by 20% on an OpenSSL-bound path is
-  ambitious.
-- The x86-sandbox numbers were CLI-based and are superseded by this
-  library-vs-library measurement; they are not a valid basis for the target.
+## Concurrency (Phase 2) — the apparent win, and why it was an artifact
+
+Added a concurrent bench mode (`BENCH_CONCURRENCY=K`) with a **fair** baseline: K OS threads, each its own libcurl `Easy` handle (keep-alive). 8-core board:
+
+| K | ylong vs libcurl |
+|---|------------------|
+| 1 | +0.3% |
+| 2 | −6% |
+| 4 | −28% |
+| **8** | **+26%** (stable across runs) |
+| 16 | +14% |
+
+The +26% at K=8 *appeared* to meet ≥20% — but the curve is **non-monotonic** (behind at K=4, ahead at K=8), which pointed to a **co-location confound**: in this single-machine loopback bench the ylong client shares one tokio runtime with the proxy+origin fixtures, while the libcurl client's K blocking OS threads **oversubscribe** against the fixtures' separate 8-thread runtime (≈16 threads on 8 cores at K=8). The "win" was scheduling artifact, not client efficiency.
+
+## Rigorous test — process-isolated, CPU-pinned (the defensible number)
+
+`BENCH_ROLE=server|client`: fixtures run in a **separate process pinned to cores 0–3** (`taskset`), client pinned to cores 4–7. Both clients then hit an identical isolated server.
+
+| K (client on 4 cores) | ylong vs libcurl (isolated) |
+|---|---|
+| 1 | −0.8% / +0.2% → **parity** |
+| 2 | +0.2% / +0.0% → **parity** |
+| 4 | **−16.6% / −12.5%** → ylong behind |
+
+**The +26%@K=8 disappears once the confound is removed.** ylong is at parity at low concurrency and ~−14% when the client cores are saturated.
+
+## Root cause (perf) — why, definitively
+
+Profiled the 256 KB case (server in a separate process) with `perf`:
+
+- **Same cipher**: both negotiate `TLSv1.2 / ECDHE-RSA-CHACHA20-POLY1305`; `perf` shows the identical `EVP_DecryptUpdate` (ChaCha20) symbol at ~5.7% for both. Crypto ruled out.
+- **Same work**: instructions ≈ equal (ylong 21.31 B vs libcurl 21.12 B).
+- **The difference is context-switches**: `perf stat` — ylong **110,794** vs libcurl **3,407** (≈33×, ~37/req vs ~1/req), giving ylong lower IPC (1.27 vs 1.42) and +13% cycles / +18% CPU-time.
+
+Mechanism (code-confirmed): ylong's async readiness I/O parks on `Poll::Pending` whenever the socket returns `WouldBlock` (`ssl_stream/wrapper.rs` → `bio.rs` `SHOULD_RETRY` → `SSL_read` `WANT_READ` → `Pending`); on the **multi-thread** runtime each re-wake is a cross-thread scheduler hand-off (context-switch). The **nested TLS-in-TLS** proxy path doubles it (each wake re-drives two `SSL_read` state machines). libcurl does a blocking `read()` loop on one thread → ~0 switches per record.
+
+**Validation:** switching ylong to a **current-thread runtime** (`BENCH_RT=current`) collapses context-switches **110,794 → 4,328** (≈ libcurl's 3,407) — confirming the multi-thread cross-thread wake is the cause.
+
+## Final verdict — honest (revised after perf)
+
+- **In a fair, non-CPU-contended test (server isolated in its own process, ample cores), `ylong_http_client` is at PARITY with libcurl — including single-connection AND 256 KB large bodies (+0.7% / +1.3%).** The earlier **−35% (large body), −14% (concurrency), +26% (K=8)** figures were all **CPU-contention / co-location artifacts** (client and server sharing one runtime/cores), not real client deficits — now retracted.
+- **The "≥20% over libcurl" goal is NOT achievable** in any fair configuration: the honest result is **parity**. Both are OpenSSL-bound on the same TLS-in-TLS path with the same cipher and the same instruction count.
+- **ylong's one real CPU overhead** vs libcurl is **~33× context-switches** from the multi-thread async runtime's cross-thread wakes per I/O readiness event. It only costs wall-clock under **CPU saturation** (co-located, or concurrency ≈ cores, where it shows as ~−14%); with spare cores ylong reaches parity despite it.
+
+**Actionable optimizations (reach parity under load, not +20%):**
+- **Use a current-thread runtime (or pin a connection's task to one worker)** for few-connection workloads — collapses the cross-thread wakes to libcurl level (measured 110k→4k). This is the highest-impact lever and is largely a *runtime/usage* choice.
+- Drain the socket fully per wake and buffer the inner proxy-TLS layer to cut the nested-TLS double-yield (library change, moderate).
+- Connection-pool serialization under concurrency (`util/pool.rs` global mutex + `exist_h1_conn` take-all rebuild).
+
+ylong's async model's true advantage is **multiplexing many connections on few threads** (where libcurl would need many OS threads), not single-connection throughput — and fixing the per-connection context-switch waste above is exactly what makes that concurrent case scale.

@@ -271,8 +271,10 @@ impl UntilClose {
                     // Disconnected for http1.
                     io.shutdown();
                 } else {
-                    self.interceptors
-                        .intercept_output(&buf[read..(read + filled)])?;
+                    if !self.interceptors.is_noop() {
+                        self.interceptors
+                            .intercept_output(&buf[read..(read + filled)])?;
+                    }
                     self.io = Some(io);
                 }
                 read += filled;
@@ -401,7 +403,9 @@ impl Text {
                     return Poll::Ready(err_from_msg!(BodyDecode, "Response body incomplete"));
                 }
                 let (text, rem) = self.decoder.decode(read_buf.filled());
-                self.interceptors.intercept_output(read_buf.filled())?;
+                if !self.interceptors.is_noop() {
+                    self.interceptors.intercept_output(read_buf.filled())?;
+                }
                 read += filled;
                 // Contains redundant `rem`, return error.
                 match (text.is_complete(), rem.is_empty()) {
@@ -502,7 +506,9 @@ impl Chunk {
                         return Poll::Ready(err_from_msg!(BodyDecode, "Response body incomplete"));
                     }
                     let (size, flag) = self.merge_chunks(read_buf.filled_mut())?;
-                    self.interceptors.intercept_output(read_buf.filled_mut())?;
+                    if !self.interceptors.is_noop() {
+                        self.interceptors.intercept_output(read_buf.filled_mut())?;
+                    }
                     read += size;
                     if flag {
                         // Return if we find a 0-sized chunk.

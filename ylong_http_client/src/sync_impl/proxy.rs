@@ -18,6 +18,7 @@
 //! [`TunnelConnect`] abstraction so that new proxy protocols can be added
 //! without changing the connector.
 
+use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
@@ -135,9 +136,23 @@ pub(crate) fn connect_tunnel<S>(
 where
     S: Read + Write,
 {
-    let mut req = Vec::new();
+    // Pre-size a single allocation for the whole request so the tunnel setup
+    // performs one heap allocation instead of growing a `Vec` incrementally.
+    // The fixed overhead below counts the literal bytes (request line, `Host:`
+    // header, optional `Proxy-Authorization` header, and trailing CRLF); `port`
+    // is at most 5 digits.
+    let mut cap = "CONNECT :".len()
+        + " HTTP/1.1\r\nHost: :".len()
+        + "\r\n".len()
+        + "\r\n".len()
+        + host.len() * 2
+        + 5 * 2;
+    if let Some(value) = &auth {
+        cap += "Proxy-Authorization: Basic \r\n".len() + value.len();
+    }
+    let mut req = String::with_capacity(cap);
 
-    // `unwrap()` never fails here (writing into a `Vec`).
+    // `unwrap()` never fails here (writing into a `String`).
     write!(
         &mut req,
         "CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n"
@@ -148,9 +163,9 @@ where
         write!(&mut req, "Proxy-Authorization: Basic {value}\r\n").unwrap();
     }
 
-    write!(&mut req, "\r\n").unwrap();
+    req.push_str("\r\n");
 
-    conn.write_all(&req)
+    conn.write_all(req.as_bytes())
         .map_err(|e| HttpClientError::from_error(ErrorKind::Connect, e))?;
 
     let mut buf = [0; 8192];

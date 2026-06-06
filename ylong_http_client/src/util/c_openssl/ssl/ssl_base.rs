@@ -137,6 +137,20 @@ impl SslRef {
         unsafe { X509VerifyParamRef::from_ptr_mut(SSL_get0_param(self.as_ptr())) }
     }
 
+    /// Attempts client-side TLS session resumption for `host`.
+    ///
+    /// If a session for `host` was cached by a previous connection on this
+    /// process, it is installed on this (not-yet-connected) `SSL` so that the
+    /// upcoming handshake can be abbreviated. Best-effort: on a cache miss or
+    /// any failure the connection simply performs a full handshake.
+    pub(crate) fn try_resume_session(&mut self, host: &str) {
+        // Safety: `self.as_ptr()` is a valid `*mut SSL` that has not yet started
+        // its handshake (called from `ssl_new` before `SSL_connect`).
+        unsafe {
+            let _ = super::session::try_set_cached_session(self.as_ptr(), host);
+        }
+    }
+
     pub(crate) fn set_verify_hostname(&mut self, host_name: &str) -> Result<(), ErrorStack> {
         let param = self.param_mut();
         param.set_hostflags(X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);

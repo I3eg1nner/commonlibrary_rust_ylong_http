@@ -36,7 +36,14 @@ use crate::util::interceptor::Interceptors;
 use crate::util::normalizer::BodyLengthParser;
 use crate::ErrorKind::BodyTransfer;
 
-const TEMP_BUF_SIZE: usize = 16 * 1024;
+// Scratch buffer used both for encoding the request (request line, headers and
+// body) and for reading the response status line / leftover body bytes. A
+// larger buffer lets a big (e.g. 256 KiB) response body be drained in ~4
+// `poll_read` calls instead of ~16, cutting per-read syscall / BIO / poll /
+// dispatch overhead (the benefit is doubled in the nested TLS-in-TLS proxy
+// case). The same buffer drives the request-encode path, where 64 KiB is a
+// harmless one-time per-request allocation.
+const BODY_BUF_SIZE: usize = 64 * 1024;
 
 pub(crate) async fn request<S>(
     mut conn: Http1Conn<S>,
@@ -48,7 +55,14 @@ where
     message
         .interceptor
         .intercept_request(message.request.ref_mut())?;
-    let mut buf = vec![0u8; TEMP_BUF_SIZE];
+    // NOTE: the buffer is handed out as `&mut [u8]` to `RequestEncoder::encode`
+    // and to user-supplied `Body::data` implementations, both of which are free
+    // to read it. Exposing uninitialized memory as an initialized slice (e.g.
+    // via `Vec::with_capacity` + `set_len`) would therefore be UB, so the buffer
+    // is zero-initialized once per request. The zeroing is a single bulk memset
+    // (cheap relative to the request) and the allocation is reused across the
+    // whole encode/read loop below, so it is not repeated per chunk.
+    let mut buf = vec![0u8; BODY_BUF_SIZE];
 
     message
         .request
@@ -65,11 +79,14 @@ where
     .await?;
     encode_various_body(message.request.ref_mut(), &mut conn, &mut buf).await?;
     // Decodes response part.
+    let speed_limited = conn.speed_controller.is_enabled();
     let (part, pre) = {
         let mut decoder = ResponseDecoder::new();
         loop {
             let size = poll_fn(|cx| {
-                if conn.speed_controller.poll_recv_pending_timeout(cx) {
+                // Skip the (otherwise no-op) speed-controller checks on the
+                // common path where no speed limit is configured.
+                if speed_limited && conn.speed_controller.poll_recv_pending_timeout(cx) {
                     return Poll::Ready(Err(HttpClientError::from_str(
                         BodyTransfer,
                         "Below low speed limit",
@@ -78,14 +95,18 @@ where
                 let result =
                     read_status_line(cx, &mut conn, message.request.ref_mut(), buf.as_mut_slice())?;
                 if let Poll::Ready(filled) = result {
-                    conn.speed_controller.reset_recv_pending_timeout();
+                    if speed_limited {
+                        conn.speed_controller.reset_recv_pending_timeout();
+                    }
                     return Poll::Ready(Ok(filled));
                 }
                 Poll::Pending
             })
             .await?;
 
-            message.interceptor.intercept_output(&buf[..size])?;
+            if !message.interceptor.is_noop() {
+                message.interceptor.intercept_output(&buf[..size])?;
+            }
             match decoder.decode(&buf[..size]) {
                 Ok(None) => {}
                 Ok(Some((part, rem))) => break (part, rem),
@@ -199,7 +220,9 @@ where
         match part_encoder.encode(&mut buf[..]) {
             Ok(0) => break,
             Ok(written) => {
-                interceptor.intercept_input(&buf[..written])?;
+                if !interceptor.is_noop() {
+                    interceptor.intercept_input(&buf[..written])?;
+                }
                 // RequestEncoder writes `buf` as much as possible.
                 if let Err(e) = conn.raw_mut().write_all(&buf[..written]).await {
                     conn.shutdown();
@@ -280,6 +303,9 @@ where
     S: AsyncRead + AsyncWrite + Sync + Send + Unpin + 'static,
 {
     // Encodes Request Body.
+    // Skip the (otherwise no-op) speed-controller work on the common path where
+    // no speed limit is configured.
+    let speed_limited = conn.speed_controller.is_enabled();
     let mut written = 0;
     let mut end_body = false;
     while !end_body {
@@ -290,12 +316,14 @@ where
             end_body = end;
         }
         if written == buf.len() || end_body {
-            conn.speed_controller.init_min_send_if_not_start();
-            conn.speed_controller.init_max_send_if_not_start();
+            if speed_limited {
+                conn.speed_controller.init_min_send_if_not_start();
+                conn.speed_controller.init_max_send_if_not_start();
+            }
             let mut write_size = 0;
             loop {
                 let write_res = poll_fn(|cx| {
-                    if conn.speed_controller.poll_send_pending_timeout(cx) {
+                    if speed_limited && conn.speed_controller.poll_send_pending_timeout(cx) {
                         return Poll::Ready(Err(HttpClientError::from_str(
                             BodyTransfer,
                             "Below low speed limit",
@@ -303,8 +331,10 @@ where
                     }
                     let write_poll =
                         Pin::new(conn.raw_mut()).poll_write(cx, &buf[write_size..written]);
-                    if let Poll::Ready(Ok(_)) = write_poll {
-                        conn.speed_controller.reset_send_pending_timeout();
+                    if speed_limited {
+                        if let Poll::Ready(Ok(_)) = write_poll {
+                            conn.speed_controller.reset_send_pending_timeout();
+                        }
                     }
                     write_poll.map_err(|e| HttpClientError::from_error(BodyTransfer, e))
                 })
@@ -320,10 +350,12 @@ where
                     break;
                 }
             }
-            if conn.speed_controller.need_limit_max_send_speed() {
-                conn.speed_controller.max_send_speed_limit(written).await;
+            if speed_limited {
+                if conn.speed_controller.need_limit_max_send_speed() {
+                    conn.speed_controller.max_send_speed_limit(written).await;
+                }
+                conn.speed_controller.min_send_speed_limit(written)?;
             }
-            conn.speed_controller.min_send_speed_limit(written)?;
             written = 0;
         }
     }
@@ -363,6 +395,11 @@ impl<S: AsyncRead + Unpin> AsyncRead for Http1Conn<S> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
+        // Fast path: no speed limit configured, so all of the speed-controller
+        // calls below are no-ops. Read directly to avoid them on every poll.
+        if !self.speed_controller.is_enabled() {
+            return Pin::new(self.raw_mut()).poll_read(cx, buf);
+        }
         if self.speed_controller.poll_recv_pending_timeout(cx) {
             return Poll::Ready(Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,

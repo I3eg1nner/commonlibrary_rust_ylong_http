@@ -64,6 +64,14 @@ impl SpeedController {
         }
     }
 
+    /// Returns `true` iff any send/recv speed limit is configured. Lets the
+    /// hot read/write paths skip the (otherwise no-op) speed-controller block
+    /// entirely when running without any speed limit.
+    #[inline]
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.send_rate_limit.is_enabled() || self.recv_rate_limit.is_enabled()
+    }
+
     pub(crate) fn need_limit_max_send_speed(&self) -> bool {
         self.send_rate_limit.need_limit_max_speed()
     }
@@ -146,6 +154,11 @@ impl RateLimit {
     pub(crate) fn set_max_speed(&mut self, rate: u64, period: Duration) {
         let limit = SpeedLimit::new(rate, period, Duration::default());
         self.max_speed = Some(limit)
+    }
+
+    #[inline]
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.min_speed.is_some() || self.max_speed.is_some()
     }
 
     pub(crate) fn need_limit_max_speed(&self) -> bool {

@@ -407,6 +407,21 @@ impl TlsConfigBuilder {
             });
         }
 
+        // Enable client-side TLS session resumption only on contexts that use
+        // standard verification. A resumed handshake skips certificate, custom
+        // cert-verifier and hostname checks, so resumption must never be enabled
+        // when a custom verifier or public-key pinning is in effect (pinning
+        // inspects the peer chain, which is absent on resumption → fail closed;
+        // a custom verifier is per-connection and would be skipped). The common
+        // CA-verification path (no verifier, no pins) keeps resumption, and the
+        // per-`SSL_CTX` cache key isolates it from any relaxed contexts.
+        if self.cert_verifier.is_none() && self.pins.is_none() {
+            self.inner = self.inner.map(|mut builder| {
+                builder.enable_client_session_cache();
+                builder
+            });
+        }
+
         let ctx = self
             .inner
             .map(|builder| builder.build())
@@ -476,6 +491,13 @@ impl TlsConfig {
         if self.verify_hostname {
             ssl.set_verify_hostname(domain)?;
         }
+
+        // Attempt TLS session resumption: if a session for this host was cached
+        // from a previous connection, install it so the handshake can be
+        // abbreviated. Best-effort — on a miss we fall back to a full
+        // handshake.
+        ssl.try_resume_session(domain);
+
         Ok(TlsSsl(ssl))
     }
 

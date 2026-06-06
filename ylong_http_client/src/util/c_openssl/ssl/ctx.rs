@@ -19,7 +19,11 @@ use libc::{c_int, c_uint, c_void};
 
 use super::filetype::SslFiletype;
 use super::method::SslMethod;
+use super::session::new_session_cb;
 use super::version::SslVersion;
+use crate::util::c_openssl::ffi::ssl::SSL_CTX_sess_set_new_cb;
+#[cfg(feature = "c_boringssl")]
+use crate::util::c_openssl::ffi::ssl::SSL_CTX_set_session_cache_mode;
 use crate::c_openssl::ffi::ssl::{
     SSL_CTX_free, SSL_CTX_get_cert_store, SSL_CTX_set_default_verify_paths, SSL_CTX_set_verify,
 };
@@ -47,6 +51,29 @@ const SSL_CTRL_SET_MIN_PROTO_VERSION: c_int = 123;
 const SSL_CTRL_SET_MAX_PROTO_VERSION: c_int = 124;
 #[cfg(feature = "__c_openssl")]
 const SSL_CTRL_SET_SIGALGS_LIST: c_int = 98;
+/// `SSL_CTRL_SET_SESS_CACHE_MODE`: command for `SSL_CTX_ctrl` that selects the
+/// session-cache mode (the `SSL_CTX_set_session_cache_mode` macro in OpenSSL).
+#[cfg(feature = "__c_openssl")]
+const SSL_CTRL_SET_SESS_CACHE_MODE: c_int = 44;
+/// `SSL_SESS_CACHE_CLIENT`: enable the client-side session cache so that the
+/// "new session" callback fires for established client sessions.
+const SSL_SESS_CACHE_CLIENT: c_int = 0x0001;
+/// `SSL_CTRL_MODE`: command for `SSL_CTX_ctrl` that OR-s the given mode bits
+/// into the context mode and returns the new mode (the `SSL_CTX_set_mode`
+/// macro in OpenSSL `ssl.h`).
+#[cfg(feature = "__c_openssl")]
+const SSL_CTRL_MODE: c_int = 33;
+/// `SSL_CTRL_SET_READ_AHEAD`: command for `SSL_CTX_ctrl` that toggles read-ahead
+/// (the `SSL_CTX_set_read_ahead` macro in OpenSSL `ssl.h`). With read-ahead on,
+/// OpenSSL pulls as many TLS records as fit per BIO read, cutting socket
+/// syscalls on bulk downloads.
+#[cfg(feature = "__c_openssl")]
+const SSL_CTRL_SET_READ_AHEAD: c_int = 41;
+/// `SSL_MODE_RELEASE_BUFFERS`: mode bit (passed as `larg` to `SSL_CTRL_MODE`)
+/// that lets OpenSSL free idle per-connection read/write record buffers,
+/// reducing memory/cache pressure on otherwise-idle connections.
+#[cfg(feature = "__c_openssl")]
+const SSL_MODE_RELEASE_BUFFERS: libc::c_long = 0x0000_0010;
 
 foreign_type!(
     type CStruct = SSL_CTX;
@@ -104,8 +131,84 @@ impl SslContextBuilder {
             "DEFAULT:!aNULL:!eNULL:!MD5:!3DES:!DES:!RC4:!IDEA:!SEED:!aDSS:!SRP:!PSK:!SHA1:!CBC",
         )?;
         builder.set_sigalgs_list()?;
+        // Performance knobs applied to every client context: read-ahead (fewer
+        // socket syscalls on bulk reads) and RELEASE_BUFFERS (frees idle
+        // per-connection record buffers). Best-effort; failures are non-fatal.
+        builder.tune_read_path();
+        // NOTE: client-side TLS session resumption is NOT enabled here. On a
+        // resumed handshake OpenSSL skips certificate, custom-verifier and
+        // hostname checks, so resumption must only be enabled for contexts that
+        // use standard verification. `TlsConfigBuilder::build` decides that and
+        // calls `enable_client_session_cache` only when there is no custom cert
+        // verifier and no public-key pinning.
 
         Ok(builder)
+    }
+
+    /// Enables the client-side TLS session cache and registers the "new
+    /// session" callback so established sessions are stored for resumption.
+    ///
+    /// This is best-effort and infallible from the caller's perspective: if the
+    /// underlying calls were to fail, connections simply fall back to full
+    /// handshakes.
+    ///
+    /// Only call this for contexts that use standard certificate verification
+    /// (no custom verifier, no public-key pinning): a resumed handshake skips
+    /// those checks, so enabling resumption on such a context would weaken it.
+    pub(crate) fn enable_client_session_cache(&mut self) {
+        let ptr = self.as_ptr_mut();
+        unsafe {
+            // `SSL_CTX_set_session_cache_mode` is a macro over `SSL_CTX_ctrl`
+            // in OpenSSL; boringssl exposes it as a real function.
+            #[cfg(feature = "__c_openssl")]
+            {
+                SSL_CTX_ctrl(
+                    ptr,
+                    SSL_CTRL_SET_SESS_CACHE_MODE,
+                    SSL_SESS_CACHE_CLIENT as libc::c_long,
+                    ptr::null_mut(),
+                );
+            }
+            #[cfg(feature = "c_boringssl")]
+            {
+                SSL_CTX_set_session_cache_mode(ptr, SSL_SESS_CACHE_CLIENT);
+            }
+
+            SSL_CTX_sess_set_new_cb(ptr, Some(new_session_cb));
+        }
+    }
+
+    /// Applies read-path performance knobs that reduce syscalls and memory/cache
+    /// pressure, helping large-body throughput (notably on RISC-V):
+    ///
+    /// 1. Read-ahead (`SSL_CTX_set_read_ahead`): OpenSSL pulls multiple TLS
+    ///    records per BIO read, cutting socket syscalls on bulk downloads.
+    /// 2. `SSL_MODE_RELEASE_BUFFERS` (via `SSL_CTX_set_mode`): frees idle
+    ///    per-connection record buffers, reducing cache/memory pressure.
+    ///
+    /// Both are infallible best-effort: if the underlying calls fail, the
+    /// connection simply runs without the optimization.
+    fn tune_read_path(&mut self) {
+        let ptr = self.as_ptr_mut();
+        // `SSL_CTX_set_read_ahead` and `SSL_CTX_set_mode` are macros over
+        // `SSL_CTX_ctrl` in OpenSSL. boringssl exposes them as real functions
+        // with differing semantics, so we limit this to OpenSSL (the primary
+        // target) and skip it under `c_boringssl`.
+        #[cfg(feature = "__c_openssl")]
+        unsafe {
+            // SSL_CTX_set_read_ahead(ctx, 1)
+            SSL_CTX_ctrl(ptr, SSL_CTRL_SET_READ_AHEAD, 1, ptr::null_mut());
+            // SSL_CTX_set_mode(ctx, SSL_MODE_RELEASE_BUFFERS): OR-s the mode bit
+            // into the context mode.
+            SSL_CTX_ctrl(
+                ptr,
+                SSL_CTRL_MODE,
+                SSL_MODE_RELEASE_BUFFERS,
+                ptr::null_mut(),
+            );
+        }
+        #[cfg(not(feature = "__c_openssl"))]
+        let _ = ptr;
     }
 
     /// Creates a `SslContextBuilder` from a `SSL_CTX`.

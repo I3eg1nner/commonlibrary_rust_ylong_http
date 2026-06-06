@@ -22,8 +22,8 @@
 use core::pin::Pin;
 use core::task::{Context, Poll};
 use std::error;
-use std::fmt::{Debug, Display, Formatter};
-use std::io::{Error, ErrorKind, Write};
+use std::fmt::{Debug, Display, Formatter, Write as _};
+use std::io::{Error, ErrorKind};
 
 use crate::async_impl::ssl_stream::AsyncSslStream;
 use crate::runtime::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, TcpStream};
@@ -185,20 +185,36 @@ pub(crate) async fn connect_tunnel<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut req = Vec::new();
+    // Pre-size a single allocation for the whole request so the tunnel setup
+    // performs one heap allocation instead of growing a `Vec` incrementally.
+    // The fixed overhead below counts the literal bytes (request line, `Host:`
+    // header, optional `Proxy-Authorization` header, and trailing CRLF); `port`
+    // is at most 5 digits.
+    let mut cap = "CONNECT :".len()
+        + " HTTP/1.1\r\nHost: :".len()
+        + "\r\n".len()
+        + "\r\n".len()
+        + host.len() * 2
+        + 5 * 2;
+    if let Some(value) = &auth {
+        cap += "Proxy-Authorization: Basic \r\n".len() + value.len();
+    }
+    let mut req = String::with_capacity(cap);
 
+    // `unwrap()` never fails here (writing into a `String`).
     write!(
         &mut req,
         "CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n"
-    )?;
+    )
+    .unwrap();
 
     if let Some(value) = auth {
-        write!(&mut req, "Proxy-Authorization: Basic {value}\r\n")?;
+        write!(&mut req, "Proxy-Authorization: Basic {value}\r\n").unwrap();
     }
 
-    write!(&mut req, "\r\n")?;
+    req.push_str("\r\n");
 
-    conn.write_all(&req).await?;
+    conn.write_all(req.as_bytes()).await?;
 
     let mut buf = [0; 8192];
     let mut pos = 0;

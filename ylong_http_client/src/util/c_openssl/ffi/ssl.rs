@@ -152,6 +152,69 @@ extern "C" {
 
     #[cfg(feature = "c_boringssl")]
     pub(crate) fn SSL_CTX_set1_sigalgs_list(ctx: *mut SSL_CTX, parg: *mut c_void) -> c_int;
+
+    // --- TLS session resumption (client-side) ---
+
+    /// Sets the "new session" callback. The callback is invoked by OpenSSL when
+    /// a new `SSL_SESSION` (e.g. a TLS1.3 ticket) is established for a
+    /// connection, allowing the application to store it for later resumption.
+    ///
+    /// The callback receives a reference to the session. Returning `1` means the
+    /// application has retained that reference (and is responsible for freeing
+    /// it via `SSL_SESSION_free`); returning `0` lets OpenSSL drop it.
+    ///
+    /// `SSL_CTX_set_session_cache_mode` is a macro over `SSL_CTX_ctrl` in
+    /// OpenSSL, so it is not declared here (we call `SSL_CTX_ctrl` directly with
+    /// `SSL_CTRL_SET_SESS_CACHE_MODE`).
+    #[cfg(feature = "__c_openssl")]
+    pub(crate) fn SSL_CTX_sess_set_new_cb(
+        ctx: *mut SSL_CTX,
+        new_session_cb: Option<extern "C" fn(*mut SSL, *mut SSL_SESSION) -> c_int>,
+    );
+
+    /// boringssl exposes `SSL_CTX_set_session_cache_mode` and
+    /// `SSL_CTX_sess_set_new_cb` as real functions rather than `SSL_CTX_ctrl`
+    /// macros.
+    #[cfg(feature = "c_boringssl")]
+    pub(crate) fn SSL_CTX_set_session_cache_mode(ctx: *mut SSL_CTX, mode: c_int) -> c_int;
+
+    #[cfg(feature = "c_boringssl")]
+    pub(crate) fn SSL_CTX_sess_set_new_cb(
+        ctx: *mut SSL_CTX,
+        new_session_cb: Option<extern "C" fn(*mut SSL, *mut SSL_SESSION) -> c_int>,
+    );
+}
+
+/// An opaque `SSL_SESSION`. It is reference-counted inside OpenSSL and is safe
+/// to reference / free from any thread.
+pub(crate) enum SSL_SESSION {}
+
+// for `SSL_SESSION`
+extern "C" {
+    /// Frees (decrements the reference count of) an `SSL_SESSION`.
+    pub(crate) fn SSL_SESSION_free(session: *mut SSL_SESSION);
+
+    /// Returns a pointer to the `SSL_SESSION` actually used in the connection
+    /// and increments its reference count (so it must be freed with
+    /// `SSL_SESSION_free`). Returns null if there is no session.
+    pub(crate) fn SSL_get1_session(ssl: *mut SSL) -> *mut SSL_SESSION;
+
+    /// Sets the session to be used by `ssl` before the handshake, enabling an
+    /// abbreviated (resumption) handshake. Does not take ownership of
+    /// `session` (it increments the refcount internally). Returns 1 on success.
+    pub(crate) fn SSL_set_session(ssl: *mut SSL, session: *mut SSL_SESSION) -> c_int;
+
+    /// Returns the SNI server name negotiated for `ssl` (for `type` =
+    /// `TLSEXT_NAMETYPE_host_name` == 0), or null if none. On the client side
+    /// this reflects the host name set via the SNI extension. The returned
+    /// pointer is owned by OpenSSL and must not be freed.
+    pub(crate) fn SSL_get_servername(ssl: *const SSL, kind: c_int) -> *const c_char;
+
+    /// Returns the `SSL_CTX` that `ssl` was created from. The returned pointer is
+    /// owned by `ssl` and must not be freed. Used to key the session cache per
+    /// `SSL_CTX`, so a session cached under one context (verification policy) is
+    /// never offered to a different one.
+    pub(crate) fn SSL_get_SSL_CTX(ssl: *const SSL) -> *mut SSL_CTX;
 }
 
 /// This is the main SSL/TLS structure which is created by a server or client

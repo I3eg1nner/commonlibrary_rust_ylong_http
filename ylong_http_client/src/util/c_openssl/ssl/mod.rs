@@ -15,6 +15,7 @@ mod ctx;
 mod error;
 mod filetype;
 mod method;
+mod session;
 mod ssl_base;
 mod stream;
 mod version;
