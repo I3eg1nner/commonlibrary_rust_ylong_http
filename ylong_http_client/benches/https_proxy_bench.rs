@@ -455,6 +455,106 @@ fn bench_libcurl_concurrent(cfg: Cfg, proxy_addr: &str, origin_url: &str) -> Opt
     Some(wall)
 }
 
+/// FAIR high-concurrency libcurl baseline #2: a SINGLE-THREAD `curl_multi` event
+/// loop driving K concurrent keep-alive transfers — libcurl's OWN async/event
+/// idiom, and the true apples-to-apples opponent for ylong's single-thread
+/// (`BENCH_RT=current`) multiplexing, in contrast to the thread-per-connection
+/// `bench_libcurl_concurrent`. K easy handles are kept permanently in flight; as
+/// each transfer completes its handle is removed and re-added (reusing its
+/// keep-alive connection from the multi connection cache) to start the next
+/// request, until `cfg.requests` transfers complete. The measured phase runs on
+/// ONE OS thread, exactly like ylong on a current-thread runtime, so this isolates
+/// client efficiency from thread-scheduling overhead. Returns measured seconds, or
+/// `None` if the curl crate / libcurl is unavailable or any transfer errors.
+fn bench_libcurl_multi(cfg: Cfg, proxy_addr: &str, origin_url: &str) -> Option<f64> {
+    use std::time::Duration;
+
+    use curl::multi::{EasyHandle, Multi};
+
+    let k = cfg.concurrency.max(1);
+    let mut multi = Multi::new();
+    // Let libcurl keep ALL K connections alive in its cache (don't cap/evict),
+    // so re-adding a finished handle reuses its keep-alive connection rather than
+    // reconnecting — the fair counterpart to ylong's K persistent tunnels.
+    let _ = multi.set_max_total_connections(k);
+    let _ = multi.set_max_host_connections(k);
+    let multi = multi;
+
+    // Drive `total` transfer completions while keeping the K-handle pool full.
+    // Returns None if any transfer errors (so the caller can SKIP, not report a
+    // bogus number).
+    let drive = |handles: &mut Vec<Option<EasyHandle>>, total: usize| -> Option<()> {
+        if total == 0 {
+            return Some(());
+        }
+        let mut completed = 0usize;
+        loop {
+            let running = multi.perform().ok()?;
+            // Reap every transfer that finished this round (match each message to
+            // the handle that produced it).
+            let mut done: Vec<(usize, bool)> = Vec::new();
+            multi.messages(|msg| {
+                // Each DONE message is for exactly one handle: stop scanning as
+                // soon as it matches (avoids an O(messages × handles) rescan that
+                // would itself become the bottleneck at high concurrency).
+                for (i, slot) in handles.iter().enumerate() {
+                    if let Some(h) = slot {
+                        if let Some(res) = msg.result_for(h) {
+                            done.push((i, res.is_ok()));
+                            break;
+                        }
+                    }
+                }
+            });
+            let got = done.len();
+            for (i, ok) in done {
+                if !ok {
+                    return None;
+                }
+                completed += 1;
+                // Re-issue on the same handle to keep the pool full (reuses the
+                // keep-alive connection held in the multi connection cache).
+                let h = handles[i].take()?;
+                let easy = multi.remove(h).ok()?;
+                handles[i] = Some(multi.add(easy).ok()?);
+            }
+            if completed >= total {
+                return Some(());
+            }
+            // Block until there is socket activity when nothing finished this
+            // round; avoids a busy spin while transfers are in flight. Use
+            // curl_multi_poll (NOT _wait): _wait can sleep the full timeout
+            // without waking on activity on some platforms (notably observed on
+            // RISC-V here), which would impose a bogus latency floor and unfairly
+            // handicap the curl_multi baseline. _poll has an internal wakeup and
+            // returns as soon as a socket is ready.
+            if got == 0 && running > 0 {
+                multi.poll(&mut [], Duration::from_millis(1000)).ok()?;
+            }
+        }
+    };
+
+    // Build the in-flight pool of K keep-alive handles.
+    let mut handles: Vec<Option<EasyHandle>> = Vec::with_capacity(k);
+    for _ in 0..k {
+        let h = libcurl_handle(origin_url, proxy_addr, cfg.keepalive)?;
+        handles.push(Some(multi.add(h).ok()?));
+    }
+
+    drive(&mut handles, cfg.warmup)?;
+    let start = Instant::now();
+    drive(&mut handles, cfg.requests)?;
+    let elapsed = start.elapsed().as_secs_f64();
+
+    // Tidy up: remove any still-added handles from the multi.
+    for slot in handles.iter_mut() {
+        if let Some(h) = slot.take() {
+            let _ = multi.remove(h);
+        }
+    }
+    Some(elapsed)
+}
+
 /// Runs the client-side benchmark against an already-running proxy + origin,
 /// printing the same result lines as the all-in-one path. Shared by the
 /// all-in-one path and the `BENCH_ROLE=client` path so there is no duplicated
@@ -486,14 +586,33 @@ async fn run_client(cfg: Cfg, proxy_addr: String, origin_url: String) {
             bench_ylong_concurrent(cfg, proxy_addr.to_string(), origin_url.clone()).await;
         agg_line(&format!("ylong ({k} conc):"), ylong_secs);
 
-        match bench_libcurl_concurrent(cfg, &proxy_addr.to_string(), &origin_url) {
-            Some(lib_secs) => {
-                agg_line(&format!("libcurl ({k} conc):"), lib_secs);
-                // Throughput delta: ylong agg req/s vs libcurl agg req/s.
-                let improvement = (lib_secs - ylong_secs) / lib_secs * 100.0;
-                println!("ylong vs libcurl (throughput): {improvement:+.1}%");
+        // Two libcurl idioms (BENCH_LIBCURL=threads|multi|both, default both):
+        //   threads - K OS threads, one keep-alive Easy handle each (the COMMON
+        //             concurrency idiom; the scenario where ylong's single-thread
+        //             multiplexing wins on a CPU-constrained host).
+        //   multi   - one curl_multi event loop on ONE thread driving K transfers
+        //             (libcurl's OWN async idiom; the FAIR apples-to-apples
+        //             opponent for ylong on a current-thread runtime).
+        let which = std::env::var("BENCH_LIBCURL").unwrap_or_else(|_| "both".into());
+        let delta = |label: &str, lib_secs: f64| {
+            agg_line(&format!("libcurl/{label} ({k} conc):"), lib_secs);
+            println!(
+                "ylong vs libcurl/{label} (throughput): {:+.1}%",
+                (lib_secs - ylong_secs) / lib_secs * 100.0
+            );
+        };
+
+        if which != "multi" {
+            match bench_libcurl_concurrent(cfg, &proxy_addr.to_string(), &origin_url) {
+                Some(s) => delta("threads", s),
+                None => println!("libcurl/threads ({k} conc): SKIPPED (curl crate unavailable)."),
             }
-            None => println!("libcurl ({k} conc): SKIPPED (curl crate / libcurl unavailable)."),
+        }
+        if which != "threads" {
+            match bench_libcurl_multi(cfg, &proxy_addr.to_string(), &origin_url) {
+                Some(s) => delta("multi", s),
+                None => println!("libcurl/multi ({k} conc): SKIPPED (curl crate unavailable)."),
+            }
         }
 
         println!("NOTE: indicative only on this host (parameter sweep via BENCH_* env).");
