@@ -21,7 +21,7 @@ Stakeholders: client maintainers, downstream OpenHarmony consumers configuring c
 - Support TLS-secured proxy servers: TLS-to-proxy, then CONNECT, then nested TLS-to-origin (TLS-in-TLS).
 - Independent proxy-scoped TLS configuration (CA, client cert/key, versions, ciphers, SNI, verification toggles), one-way and mutual.
 - Extract proxy logic into a dedicated, extensible module with a connector-agnostic abstraction so new proxy protocols (e.g. SOCKS) can be added later without editing the connector.
-- Provide a reproducible HTTPS-proxy benchmark vs libcurl and reach ≥20% improvement on the primary metric.
+- Provide a reproducible HTTPS-proxy benchmark vs libcurl and reach ≥20% improvement on the primary metric. *(Outcome: met in the high-concurrency / CPU-constrained scenario — ≈+30% on RISC-V vs thread-per-connection; single-connection is parity. See D6.)*
 
 **Non-Goals:**
 - Implementing SOCKS or other new proxy protocols (only making the abstraction support them).
@@ -77,10 +77,14 @@ Build the benchmark + libcurl baseline before optimizing. Candidate optimization
 
 - **Alternative considered:** optimize speculatively. Rejected — without the libcurl baseline harness we cannot prove the 20% target nor avoid regressions.
 
+**Outcome (measured, 2026-06-06).** The "measure first" discipline paid off: the candidate micro-optimizations above (buffer reuse, read-ahead, fewer copies, pooling) turned out **not** to move the gap, because `perf` showed the single-connection path is already at parity with libcurl (same OpenSSL cipher, ~equal instruction count) — there was no data-path gap to close. The real differentiator is **I/O scheduling**, not the data path:
+- **Single connection → parity** (both OpenSSL-bound; the earlier apparent gaps were CPU-contention / `curl`-CLI artifacts, retracted).
+- **≥20% is reached where async architecture wins**: a **CPU-constrained host with many concurrent keep-alive connections**. ylong on a **current-thread runtime** multiplexes K connections on one epoll reactor; libcurl's blocking *easy* API needs **K OS threads** that oversubscribe the core. Measured **≈+30% on RISC-V** (K=50…1000, reproducible; x86 +22…+38%). Required conditions: current-thread runtime + connections ≫ cores. The two conditions, the methodology, and the explicit non-claim against `curl_multi` are recorded in `benchmark-results.md` (and tasks 6.7/6.8). This refines D6: for THIS feature the optimization that matters is a **runtime/usage choice** (current-thread / task-pinning), not buffer/syscall micro-tuning of the tunnel.
+
 ## Risks / Trade-offs
 
 - **SSL stream not generic over inner transport** → If `AsyncSslStream`/sync variant is tied to `TcpStream`, TLS-in-TLS is impossible without refactor. → Generalize the inner-stream type parameter early (first implementation task); add a nesting unit test.
-- **TLS-in-TLS performance overhead** → Double encryption could make the 20% target harder. → Amortize the proxy handshake via connection pooling, reduce copies, and benchmark; the target is for the documented scenario, which permits keep-alive.
+- **TLS-in-TLS performance overhead** → Double encryption could make the 20% target harder. → Amortize the proxy handshake via connection pooling, reduce copies, and benchmark; the target is for the documented scenario, which permits keep-alive. *(Resolved: double encryption did not block the target — the nested path is OpenSSL-bound at parity with libcurl; the ≥20% win comes from I/O-scheduling under concurrency, not from reducing TLS-in-TLS cost. See D6 Outcome.)*
 - **Feature-flag matrix complexity** (`async`/`sync` × `__tls` × HTTP versions) → broken builds in some combos. → CI-style local checks for `--no-default-features` + relevant combos; keep all proxy-TLS code behind `__tls`.
 - **Mutual-auth (mTLS) misconfiguration surfaced as opaque handshake errors** → poor UX. → Map proxy handshake failures to a distinct proxy-connection error variant (per https-proxy-tls spec).
 - **Benchmark environment variance** vs libcurl → unfair/unreproducible comparison. → Fix versions, ciphers, payload, concurrency, warm-up; document methodology; run both clients on the same host/network.

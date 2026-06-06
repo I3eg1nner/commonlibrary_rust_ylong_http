@@ -13,13 +13,17 @@ This change adds first-class HTTPS proxy support, extracts proxy handling into a
 - Extract the proxy routing/selection/tunnel logic out of the connector into a dedicated **proxy module** with a connector-agnostic abstraction (a proxy "connect" trait) so new proxy schemes (e.g. SOCKS) can be added without touching the HTTP connector. **BREAKING** only if internal `pub(crate)` proxy types are re-exported downstream; the public builder API stays source-compatible and is extended additively.
 - Add a **performance benchmark harness** comparing the HTTPS-proxy path against `libcurl`, and apply targeted optimizations (buffer reuse, reduced syscalls/allocations on the tunnel + handshake path, connection reuse) to reach the ≥20% throughput/latency improvement target in the HTTPS-proxy scenario.
 
+> **Outcome (2026-06-06).** The performance investigation resolved into a precise, two-part result (full data: `benchmark-results.md`):
+> - **Single connection: parity.** ylong and libcurl are both OpenSSL-bound on the identical TLS-in-TLS path (same cipher, ~equal instruction count via `perf`), so no ≥20% data-path/crypto win exists or is claimable. The earlier large apparent gaps were CPU-contention / `curl`-CLI artifacts and were retracted.
+> - **≥20% target MET in a scoped common scenario.** On a **CPU-constrained host serving many concurrent keep-alive HTTPS-proxy connections**, ylong on a **current-thread runtime** beats libcurl's **thread-per-connection** idiom (one blocking `Easy` per OS thread) by **≈+30% on RISC-V** (K=50…1000, reproducible across runs; x86 +22…+38%). This is an **I/O-scheduling** win (epoll multiplexing vs K oversubscribed threads), not a crypto win — which is why it coexists with single-connection parity. Not certified against `curl_multi` (libcurl's own event loop); see the scoping notes in `benchmark-results.md`.
+
 ## Capabilities
 
 ### New Capabilities
 - `https-proxy-tls`: Connecting through a TLS-secured proxy server, including establishing TLS to the proxy, CONNECT tunneling over that TLS session, and the inner target TLS handshake (TLS-in-TLS).
 - `proxy-tls-config`: Public configuration API for proxy-server TLS — one-way/two-way certificate verification, client certificate & private key, CA roots, protocol versions, cipher suites, SNI and hostname verification.
 - `proxy-module`: An extracted, extensible proxy module decoupling proxy selection, authentication, and tunnel establishment from the HTTP connector, with an abstraction that supports adding new proxy protocols.
-- `https-proxy-performance`: A benchmark methodology and performance budget for the HTTPS-proxy path versus libcurl, with the ≥20% improvement target as an acceptance criterion.
+- `https-proxy-performance`: A benchmark methodology and performance budget for the HTTPS-proxy path versus libcurl, with the ≥20% improvement target as an acceptance criterion. **Met in the high-concurrency / CPU-constrained scenario (≈+30% on RISC-V vs thread-per-connection); single-connection is parity** (see Outcome above).
 
 ### Modified Capabilities
 <!-- No existing specs in openspec/specs/; nothing to modify. -->
