@@ -278,6 +278,45 @@ impl TlsConfigBuilder {
         self
     }
 
+    /// Sets the list of ALPN protocols offered during the TLS handshake, in
+    /// preference order (e.g. `["h2", "http/1.1"]`). This applies to whichever
+    /// connection the `TlsConfig` is used for — including a TLS-secured (HTTPS)
+    /// proxy when the config is passed to [`Proxy::tls_config`].
+    ///
+    /// Each protocol is encoded into the ALPN wire format (a one-byte length
+    /// prefix followed by the protocol bytes). Empty entries, and entries longer
+    /// than 255 bytes (not representable in ALPN), are skipped.
+    ///
+    /// Requires OpenSSL 1.0.2 / LibreSSL 2.6.1 or newer.
+    ///
+    /// [`Proxy::tls_config`]: crate::Proxy
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ylong_http_client::TlsConfig;
+    ///
+    /// let config = TlsConfig::builder()
+    ///     .alpn_protocols(&["h2", "http/1.1"])
+    ///     .build()
+    ///     .unwrap();
+    /// ```
+    pub fn alpn_protocols<S: AsRef<str>>(mut self, protocols: &[S]) -> Self {
+        let mut wire = Vec::new();
+        for proto in protocols {
+            let bytes = proto.as_ref().as_bytes();
+            if bytes.is_empty() || bytes.len() > u8::MAX as usize {
+                continue;
+            }
+            wire.push(bytes.len() as u8);
+            wire.extend_from_slice(bytes);
+        }
+        self.inner = self
+            .inner
+            .and_then(|mut builder| builder.set_alpn_protos(&wire).map(|_| builder));
+        self
+    }
+
     /// Controls the use of built-in system certificates during certificate
     /// validation. Default to `true` -- uses built-in system certs.
     pub fn build_in_root_certs(mut self, is_use: bool) -> Self {

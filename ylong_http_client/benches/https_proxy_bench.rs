@@ -61,6 +61,11 @@ struct Cfg {
     payload: usize,
     keepalive: bool,
     concurrency: usize,
+    /// Artificial per-response delay injected by the origin server (ms). Applied
+    /// identically to ylong and libcurl, it simulates network/processing latency
+    /// (an RTT-like floor) so the bench can probe behaviour under latency without
+    /// needing `tc netem`/root. 0 = none.
+    delay_ms: u64,
 }
 
 fn cfg() -> Cfg {
@@ -78,7 +83,23 @@ fn cfg() -> Cfg {
             .map(|v| v != "0")
             .unwrap_or(true),
         concurrency: g("BENCH_CONCURRENCY", 1).max(1),
+        delay_ms: g("BENCH_DELAY_MS", 0) as u64,
     }
+}
+
+/// Returns (p50, p90, p99, p999) of `samples` (in whatever unit the caller
+/// stored, here milliseconds). `samples` is sorted in place. Empty input → zeros.
+fn percentiles(samples: &mut [f64]) -> (f64, f64, f64, f64) {
+    if samples.is_empty() {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let at = |q: f64| -> f64 {
+        // Nearest-rank percentile.
+        let rank = (q * samples.len() as f64).ceil() as usize;
+        samples[rank.saturating_sub(1).min(samples.len() - 1)]
+    };
+    (at(0.50), at(0.90), at(0.99), at(0.999))
 }
 // ----------------------------------------------------------------------------
 
@@ -102,7 +123,12 @@ fn tls_acceptor() -> Arc<SslAcceptor> {
 
 /// Loop-accepting origin HTTPS server; replies with a fixed-size payload and
 /// keep-alive so a single connection serves many requests.
-async fn serve_origin(listener: TcpListener, acceptor: Arc<SslAcceptor>, payload: usize) {
+async fn serve_origin(
+    listener: TcpListener,
+    acceptor: Arc<SslAcceptor>,
+    payload: usize,
+    delay_ms: u64,
+) {
     loop {
         let (stream, _) = match listener.accept().await {
             Ok(v) => v,
@@ -122,6 +148,10 @@ async fn serve_origin(listener: TcpListener, acceptor: Arc<SslAcceptor>, payload
                 .serve_connection(
                     stream,
                     hyper::service::service_fn(move |_req| async move {
+                        // Inject latency identically for every request (both clients).
+                        if delay_ms > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                        }
                         let body = vec![b'a'; payload];
                         Ok::<_, std::convert::Infallible>(
                             hyper::Response::builder()
@@ -232,7 +262,11 @@ async fn ylong_once(client: &ylong_http_client::async_impl::Client, url: &str) {
 /// connection/tunnel is reused (one client); otherwise a fresh client (hence a
 /// fresh proxy TLS tunnel + origin handshake) is used for every request, which
 /// isolates the connection-establishment cost.
-async fn bench_ylong(cfg: Cfg, proxy_addr: String, origin_url: String) -> f64 {
+///
+/// Returns `(total_seconds, per_request_latencies_ms)`; the latency vector feeds
+/// the P50/P99 report.
+async fn bench_ylong(cfg: Cfg, proxy_addr: String, origin_url: String) -> (f64, Vec<f64>) {
+    let mut lat = Vec::with_capacity(cfg.requests);
     if cfg.keepalive {
         let client = ylong_client(&proxy_addr);
         for _ in 0..cfg.warmup {
@@ -240,9 +274,11 @@ async fn bench_ylong(cfg: Cfg, proxy_addr: String, origin_url: String) -> f64 {
         }
         let start = Instant::now();
         for _ in 0..cfg.requests {
+            let t = Instant::now();
             ylong_once(&client, &origin_url).await;
+            lat.push(t.elapsed().as_secs_f64() * 1000.0);
         }
-        start.elapsed().as_secs_f64()
+        (start.elapsed().as_secs_f64(), lat)
     } else {
         for _ in 0..cfg.warmup {
             let client = ylong_client(&proxy_addr);
@@ -250,10 +286,12 @@ async fn bench_ylong(cfg: Cfg, proxy_addr: String, origin_url: String) -> f64 {
         }
         let start = Instant::now();
         for _ in 0..cfg.requests {
+            let t = Instant::now();
             let client = ylong_client(&proxy_addr);
             ylong_once(&client, &origin_url).await;
+            lat.push(t.elapsed().as_secs_f64() * 1000.0);
         }
-        start.elapsed().as_secs_f64()
+        (start.elapsed().as_secs_f64(), lat)
     }
 }
 
@@ -320,17 +358,22 @@ fn libcurl_handle(origin_url: &str, proxy_addr: &str, keepalive: bool) -> Option
     Some(h)
 }
 
-fn bench_libcurl(cfg: Cfg, proxy_addr: &str, origin_url: &str) -> Option<f64> {
+/// Returns `(total_seconds, per_request_latencies_ms)` for libcurl, or `None` if
+/// the curl crate / libcurl is unavailable.
+fn bench_libcurl(cfg: Cfg, proxy_addr: &str, origin_url: &str) -> Option<(f64, Vec<f64>)> {
     let mut h = libcurl_handle(origin_url, proxy_addr, cfg.keepalive)?;
 
     for _ in 0..cfg.warmup {
         h.perform().ok()?;
     }
+    let mut lat = Vec::with_capacity(cfg.requests);
     let start = Instant::now();
     for _ in 0..cfg.requests {
+        let t = Instant::now();
         h.perform().ok()?;
+        lat.push(t.elapsed().as_secs_f64() * 1000.0);
     }
-    Some(start.elapsed().as_secs_f64())
+    Some((start.elapsed().as_secs_f64(), lat))
 }
 
 /// Splits `total` work items across `k` workers, giving the remainder to the
@@ -621,11 +664,12 @@ async fn run_client(cfg: Cfg, proxy_addr: String, origin_url: String) {
 
     println!("== HTTPS-proxy benchmark ==");
     println!(
-        "config: requests={} warmup={} payload={}B keep-alive={}",
+        "config: requests={} warmup={} payload={}B keep-alive={} delay={}ms",
         cfg.requests,
         cfg.warmup,
         cfg.payload,
-        if cfg.keepalive { "on" } else { "off" }
+        if cfg.keepalive { "on" } else { "off" },
+        cfg.delay_ms
     );
 
     let line = |label: &str, secs: f64| {
@@ -635,14 +679,23 @@ async fn run_client(cfg: Cfg, proxy_addr: String, origin_url: String) {
             secs * 1000.0 / reqs
         );
     };
+    // Per-request latency distribution (P50/P90/P99/P99.9) — a core metric
+    // alongside mean throughput. `lat` is consumed (sorted) here.
+    let lat_line = |label: &str, mut lat: Vec<f64>| {
+        let (p50, p90, p99, p999) = percentiles(&mut lat);
+        println!(
+            "{label:<22}P50 {p50:.3} | P90 {p90:.3} | P99 {p99:.3} | P99.9 {p999:.3}  (ms/req latency)"
+        );
+    };
 
     // BENCH_ONLY=ylong|libcurl runs a single client leg (for isolated profiling,
     // e.g. `perf record`); default runs both + the curl CLI reference.
     let only = std::env::var("BENCH_ONLY").unwrap_or_default();
 
     let ylong_secs = if only != "libcurl" {
-        let s = bench_ylong(cfg, proxy_addr.to_string(), origin_url.clone()).await;
+        let (s, lat) = bench_ylong(cfg, proxy_addr.to_string(), origin_url.clone()).await;
         line("ylong_http_client:", s);
+        lat_line("ylong latency:", lat);
         Some(s)
     } else {
         None
@@ -650,8 +703,9 @@ async fn run_client(cfg: Cfg, proxy_addr: String, origin_url: String) {
 
     let lib_secs = if only != "ylong" {
         match bench_libcurl(cfg, &proxy_addr.to_string(), &origin_url) {
-            Some(s) => {
+            Some((s, lat)) => {
                 line("libcurl (library):", s);
+                lat_line("libcurl latency:", lat);
                 Some(s)
             }
             None => {
@@ -731,7 +785,7 @@ fn main() {
                 println!("ORIGIN_ADDR={origin_addr}");
                 std::io::Write::flush(&mut std::io::stdout()).unwrap();
 
-                tokio::spawn(serve_origin(origin_listener, acceptor.clone(), cfg.payload));
+                tokio::spawn(serve_origin(origin_listener, acceptor.clone(), cfg.payload, cfg.delay_ms));
                 tokio::spawn(serve_proxy(proxy_listener, acceptor.clone()));
 
                 // Keep accepting connections indefinitely; the client process
@@ -757,7 +811,7 @@ fn main() {
 
                 let origin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let origin_addr = origin_listener.local_addr().unwrap();
-                tokio::spawn(serve_origin(origin_listener, acceptor.clone(), cfg.payload));
+                tokio::spawn(serve_origin(origin_listener, acceptor.clone(), cfg.payload, cfg.delay_ms));
 
                 let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let proxy_addr = proxy_listener.local_addr().unwrap();
