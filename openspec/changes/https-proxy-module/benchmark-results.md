@@ -254,3 +254,52 @@ BENCH_ROLE=client BENCH_RT=current BENCH_CONCURRENCY=500 BENCH_LIBCURL=both \
 `BENCH_LIBCURL=threads|multi|both` selects the libcurl idiom(s); `BENCH_CONCURRENCY=K`
 sets the connection count. Raise `ulimit -n` before high-K runs (each connection is
 several fds through the TLS-in-TLS proxy; the default 1024 causes `SSL_ERROR_SYSCALL`).
+
+## RISC-V ISA-aware optimization — cipher selection (vector-AES)
+
+The single-connection parity above was measured with the AEAD the stack actually
+negotiated: **TLS 1.2 ChaCha20-Poly1305** (confirmed by the `perf` trace). But the
+test board exposes the **RISC-V vector-crypto extensions** — its `/proc/cpuinfo`
+`isa` string includes `v zvkb zvkg zvkned zvknha zvknhb zvksed zvksh zvkt` (vector
+AES `Zvkned` + vector GHASH `Zvkg`) — under which OpenSSL 3.5 runs AES-GCM far
+faster than ChaCha20. So the negotiated cipher was the *slow* one for this CPU.
+
+`openssl speed -evp` on the board (SpacemiT, `mvendorid 0x710`), 16 KB blocks:
+
+| cipher | throughput | vs ChaCha20 |
+|---|---|---|
+| ChaCha20-Poly1305 | ~373 MB/s | 1.0× |
+| **AES-128-GCM** | **~2377 MB/s** | **≈6.4×** |
+| AES-256-GCM | ~1857 MB/s | ≈5.0× |
+
+**End-to-end A/B (single connection, HTTPS proxy TLS-in-TLS, both clients pinned
+to the same cipher via `BENCH_CIPHER`, board all-in-one):**
+
+| payload | cipher | ylong req/s | ylong P99 (ms) | Δ ylong (vs ChaCha20) |
+|---|---|---|---|---|
+| 1 KB | ChaCha20 | 4,245 | 0.253 | — |
+| 1 KB | **AES-128-GCM** | 4,535 | 0.237 | **+6.8%** |
+| 256 KB | ChaCha20 | 219 | 4.72 | — |
+| 256 KB | **AES-128-GCM** | 504 | 2.03 | **+130% (2.3×)** |
+
+The cipher A/B is clean (only the AEAD changed; identical harness). **Choosing
+AES-GCM on this hardware speeds ylong's single-connection HTTPS-proxy throughput by
++6.8% at 1 KB and 2.3× at 256 KB, and roughly halves P99** — the payoff scales with
+payload because it is crypto-bound. (libcurl improves similarly, 4,091→4,514 at 1 KB
+and 299→591 at 256 KB, since it hits the same OpenSSL. The absolute ylong-vs-libcurl
+gap at 256 KB here, −36%/−17%, is the all-in-one co-location artifact discussed above,
+not part of this cipher result.)
+
+**Shipped as an opt-in, zero-cost-elsewhere API:** `TlsConfigBuilder::prefer_hardware_aead()`
+detects `Zvkned` via `/proc/cpuinfo` and offers an **AES-GCM-first TLS 1.2 cipher list**
+when present; it applies to any `TlsConfig`, including a proxy-scoped one. TLS 1.3 needs
+no change (its default preference already puts AES-GCM ahead of ChaCha20).
+
+**No impact on non-RISC-V platforms (by construction):** the detection body is
+`#[cfg(all(target_os = "linux", target_arch = "riscv64"))]`; on every other
+target/arch the method compiles to a pure no-op (`None` → returns `self`, with **no
+`/proc/cpuinfo` read and no cipher change**). It is also opt-in, so code that does not
+call it is byte-for-byte unchanged. The `cipher_list` / `alpn_protocols` additions are
+likewise new methods that do not alter any default. Verify AES negotiation is used on
+a board with `BENCH_CIPHER=aes128` (server-pinned) or by calling `prefer_hardware_aead()`
+(client offers AES-GCM only for TLS 1.2, forcing the fast path).

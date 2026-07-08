@@ -118,6 +118,30 @@ fn tls_acceptor() -> Arc<SslAcceptor> {
     acceptor
         .set_certificate_chain_file(file("cert.pem"))
         .unwrap();
+    // BENCH_CIPHER pins the AEAD the server will accept (both TLS 1.2 and 1.3),
+    // so BOTH ylong and libcurl are forced onto the same cipher — used to measure
+    // the ISA-aware cipher-selection win on RISC-V (vector-AES makes AES-GCM
+    // ~6x faster than ChaCha20). Values: aes128 | aes256 | chacha (default: no
+    // pin, i.e. OpenSSL's normal negotiation).
+    if let Ok(c) = std::env::var("BENCH_CIPHER") {
+        let (list12, suite13) = match c.as_str() {
+            "aes128" => (
+                "ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES128-GCM-SHA256",
+                "TLS_AES_128_GCM_SHA256",
+            ),
+            "aes256" => (
+                "ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES256-GCM-SHA384",
+                "TLS_AES_256_GCM_SHA384",
+            ),
+            "chacha" => (
+                "ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-CHACHA20-POLY1305",
+                "TLS_CHACHA20_POLY1305_SHA256",
+            ),
+            other => panic!("unknown BENCH_CIPHER={other} (use aes128|aes256|chacha)"),
+        };
+        acceptor.set_cipher_list(list12).unwrap();
+        acceptor.set_ciphersuites(suite13).unwrap();
+    }
     Arc::new(acceptor.build())
 }
 
