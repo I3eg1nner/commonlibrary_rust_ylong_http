@@ -247,15 +247,28 @@ async fn serve_proxy(listener: TcpListener, acceptor: Arc<SslAcceptor>) {
 /// caps the H1 keep-alive connection pool size: K-way concurrency wants up to K
 /// parallel tunnels, while the sequential path uses 1 (matching prior behavior).
 fn ylong_client_k(proxy_addr: &str, max_h1_conn: usize) -> ylong_http_client::async_impl::Client {
-    let proxy_tls = TlsConfig::builder()
+    // BENCH_HW_AEAD=1 exercises the shipped auto-selector: the client asks for the
+    // ISA-optimal AEAD on BOTH the proxy hop and the target/origin TLS, with NO
+    // server-side cipher pin. On RISC-V vector-AES hardware this should reach the
+    // AES-GCM throughput; elsewhere it is a no-op.
+    let hw_aead = std::env::var("BENCH_HW_AEAD").as_deref() == Ok("1");
+
+    let mut proxy_tls_builder = TlsConfig::builder()
         .ca_file(file("root-ca.pem"))
-        .danger_accept_invalid_hostnames(true)
-        .build()
-        .unwrap();
-    ClientBuilder::new()
+        .danger_accept_invalid_hostnames(true);
+    if hw_aead {
+        proxy_tls_builder = proxy_tls_builder.prefer_hardware_aead();
+    }
+    let proxy_tls = proxy_tls_builder.build().unwrap();
+
+    let mut builder = ClientBuilder::new()
         .tls_ca_file(&file("root-ca.pem"))
         .danger_accept_invalid_hostnames(true)
-        .max_h1_conn_number(max_h1_conn)
+        .max_h1_conn_number(max_h1_conn);
+    if hw_aead {
+        builder = builder.tls_prefer_hardware_aead();
+    }
+    builder
         .proxy(
             Proxy::all(&format!("https://{proxy_addr}"))
                 .tls_config(proxy_tls)

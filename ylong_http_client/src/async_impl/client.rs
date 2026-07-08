@@ -953,6 +953,30 @@ impl ClientBuilder {
         self
     }
 
+    /// Selects the ISA-optimal AEAD cipher preference for the target (origin) TLS
+    /// connection on the current CPU.
+    ///
+    /// On RISC-V cores with the vector-AES extension (`Zvkned`) this prefers
+    /// AES-GCM (which OpenSSL runs several times faster than ChaCha20 there); on
+    /// any other CPU/OS it is a **no-op**, so it never affects non-RISC-V
+    /// performance. See [`TlsConfigBuilder::prefer_hardware_aead`]. For a
+    /// TLS-secured proxy hop, call `prefer_hardware_aead` on the proxy
+    /// `TlsConfig` as well.
+    ///
+    /// [`TlsConfigBuilder::prefer_hardware_aead`]: crate::TlsConfigBuilder::prefer_hardware_aead
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ylong_http_client::async_impl::ClientBuilder;
+    ///
+    /// let builder = ClientBuilder::new().tls_prefer_hardware_aead();
+    /// ```
+    pub fn tls_prefer_hardware_aead(mut self) -> Self {
+        self.tls = self.tls.prefer_hardware_aead();
+        self
+    }
+
     /// Controls the use of built-in system certificates during certificate
     /// validation. Default to `true` -- uses built-in system certs.
     ///

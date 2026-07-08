@@ -303,3 +303,43 @@ call it is byte-for-byte unchanged. The `cipher_list` / `alpn_protocols` additio
 likewise new methods that do not alter any default. Verify AES negotiation is used on
 a board with `BENCH_CIPHER=aes128` (server-pinned) or by calling `prefer_hardware_aead()`
 (client offers AES-GCM only for TLS 1.2, forcing the fast path).
+
+### Auto-selector verified end-to-end (no server pin)
+
+`prefer_hardware_aead()` is also reachable for the **target/origin** TLS via
+`async_impl::ClientBuilder::tls_prefer_hardware_aead()` (the payload crypto — and the
+256 KB win — happen on that hop, not the proxy hop). Verified on the board with
+`BENCH_HW_AEAD=1` (client asks for the ISA-optimal AEAD on both hops; **no server
+cipher pin**):
+
+| payload | config | ylong req/s | ylong P99 (ms) | vs default libcurl |
+|---|---|---|---|---|
+| 1 KB | default (→ ChaCha20) | 4,183 | 0.259 | +3.4% |
+| 1 KB | **auto → AES-GCM** | 4,445 (+6.3%) | 0.248 | **+8.4%** |
+| 256 KB | default (→ ChaCha20) | 221 | 4.57 | −35.0% |
+| 256 KB | **auto → AES-GCM** | 504 (+128%) | 2.08 | **+39.9%** |
+
+The client-side auto path reaches the **same** throughput as the server-pinned AES run
+(504 req/s @ 256 KB) — confirming the detector selects AES-GCM without any server hint.
+The ISA-aware client now also **exceeds a default-configured libcurl single-connection**
+(+8.4% @ 1 KB, +39.9% @ 256 KB), because default libcurl stays on ChaCha20 on this CPU.
+Honest scoping: this is an ISA-aware-client-vs-default-client advantage (a symmetric
+same-cipher comparison would be ~parity); the 256 KB absolute still carries the
+all-in-one co-location artifact discussed earlier, but the +128% self-delta and the
+matching pinned/auto numbers are clean.
+
+### Other RISC-V ISA levers — assessed
+
+- **Vector SHA (`Zvknha`/`Zvknhb`)**: already used by OpenSSL 3.5 for handshake
+  SHA-256/384; under keep-alive the handshake is amortized, so per-request impact is
+  negligible — no action.
+- **OpenSSL RVV crypto is already active**: `openssl speed aes-128-gcm` = 2432 MB/s vs
+  `OPENSSL_riscvcap="" ...` = 70 MB/s (~34.5× — vector-AES on), so the distro OpenSSL
+  needs no `-march=rv64gcv` rebuild. (Note: without vector-AES, scalar AES-GCM at
+  70 MB/s would be *slower* than ChaCha20's 373 MB/s — the extension is what makes
+  AES-GCM the right choice.)
+- **RVV `memcpy` on the data path**: not worth hand-rolling `unsafe` intrinsics (data
+  path is not the bottleneck; crypto — the real hotspot — is already addressed). The
+  correct, safe lever is a **build flag** — compile the crate with
+  `RUSTFLAGS="-C target-feature=+v"` (or `-C target-cpu=native`) so the compiler
+  autovectorises copies/loops. Documented as guidance, not code.
