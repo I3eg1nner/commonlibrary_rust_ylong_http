@@ -20,6 +20,8 @@ openssl = { version = "0.10.29" }
 tokio-openssl = { version = "0.6.3" }
 # 用于基准:直接链接 libcurl(库),与 ylong 做库对库的性能对比
 curl = { version = "0.4", features = ["poll_7_68_0"] }
+# 赛题工具箱建议的统计型基准框架:用于 HTTPS 代理单请求时延的严谨测量。
+criterion = { version = "0.5", features = ["async_tokio"] }
 
 [features]
 default = []
@@ -115,5 +117,11 @@ required-features = ["sync", "http1_1"]
 [[bench]]
 name = "https_proxy_bench"
 path = "benches/https_proxy_bench.rs"
+harness = false
+required-features = ["async", "http1_1", "tokio_base", "__tls"]
+
+[[bench]]
+name = "https_proxy_criterion"
+path = "benches/https_proxy_criterion.rs"
 harness = false
 required-features = ["async", "http1_1", "tokio_base", "__tls"]
