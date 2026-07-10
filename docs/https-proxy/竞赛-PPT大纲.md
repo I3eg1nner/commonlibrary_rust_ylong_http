@@ -107,8 +107,10 @@
   - 现象:测试板(SpacemiT,`mvendorid 0x710`)ISA 串含向量密码扩展 `zvkned zvkg zvknha`(向量 AES + 向量 GHASH),但 perf 显示 TLS 竟协商到**最慢**的 TLS1.2 ChaCha20
   - 硬件事实:`openssl speed`(16KB 块)AES-128-GCM ≈2377 MB/s vs ChaCha20 ≈373 MB/s(**≈6.4×**);关掉扩展(`OPENSSL_riscvcap=""`)后 AES-GCM 仅 70 MB/s < ChaCha20——**没有向量 AES 时 AES 反而更慢**,证明优化由硬件条件驱动
   - 方案:新增公开 API `TlsConfigBuilder::prefer_hardware_aead()`(任意 TlsConfig,含代理跳)与 `ClientBuilder::tls_prefer_hardware_aead()`(目标/源);检测 `Zvkned` 后对 TLS1.2 优选 AES-GCM(TLS1.3 已默认 AES 优先)。**非 RISC-V 零影响**:检测体 `#[cfg(riscv64 & linux)]` 门控、其它平台编译为空操作、且 opt-in
-  - 实测(`BENCH_HW_AEAD=1`,客户端自动选、不钉服务端):单连接 1KB 4183→4445 req/s(+6.3%)、256KB 221→504 req/s(**+128%,2.3×**),P99 4.57→2.08ms
+  - 两个 bench 旋钮佐证:`BENCH_CIPHER=aes128|chacha`(服务端钉密码,两端同一 AEAD 的干净 A/B)与 `BENCH_HW_AEAD=1`(客户端自动选、不钉服务端)
+  - 实测(`BENCH_HW_AEAD=1`):单连接 1KB 4183→4445 req/s(+6.3%)、256KB 221→504 req/s(**+128%,2.3×**),P99 4.57→2.08ms;自动选择达到与「服务端钉 AES」相同吞吐(256KB 均 504)——证明检测生效
   - **ISA 感知的 ylong 单连接即超过默认 libcurl**(默认 libcurl 仍停 ChaCha20):1KB +8.4%、256KB +39.9%
+  - 工具链已核实:发行版 OpenSSL 3.5 本就启用 RVV crypto(关扩展仅 70MB/s,即 **34.5×**),**无需 `-march=rv64gcv` 重编**;向量 SHA 亦已在握手中使用(keep-alive 摊薄);RVV memcpy 以构建旗标 `-C target-feature=+v` 指引、不手写不安全代码
 - 建议视觉:`openssl speed` AES-GCM vs ChaCha20 对比条形图 + 单连接 cipher A/B 表(开/关 ISA 优选的 RPS 与 P99)
 - 口播:板子有向量 AES 却在跑最慢的 ChaCha20——我们让客户端按 ISA 自动选 AES-GCM,单连接立刻反超默认 libcurl。
 - 诚实界定(讲稿旁注):这是「ISA 感知客户端 vs 默认客户端」的优势,对称同密码则回到持平;256KB 绝对值仍含同机 co-location 成分,但 +128% 自对比与「自动选择 = 服务端钉定同吞吐」是干净结论。
@@ -144,7 +146,7 @@
 - 要点:
   - 三子任务:HTTPS 代理与 mTLS 完成 / 模块化可扩展完成 / 性能场景达成 ≥20% 且如实界定
   - 核心价值:安全(凭据进 TLS)+ 可扩展(TunnelConnect)+ 可信(严谨诚实的性能)
-  - 亮点:**RISC-V 向量-AES ISA 感知密码优选**(`prefer_hardware_aead`),ISA 感知客户端单连接即反超默认 libcurl(1KB +8.4% / 256KB +39.9%)
+  - 亮点:**RISC-V 向量-AES ISA 感知密码优选**(`TlsConfigBuilder::prefer_hardware_aead` + `ClientBuilder::tls_prefer_hardware_aead`,对非 RISC-V 零影响),ISA 感知客户端单连接即反超默认 libcurl(1KB +8.4% / 256KB +39.9%)
   - 展望:实现 SOCKS(验证抽象)、单线程运行时/绑核作为少连接优化开关、对 curl_multi 做 `socket_action`+epoll 严谨对比
   - 一句话:能证明的才写,撤回一切经不起复核的数字
 - 建议视觉:三子任务完成度雷达图 + 展望路线条
