@@ -1,6 +1,6 @@
 # 竞赛 PPT 制作大纲 —— ylong_http_client HTTPS 代理支持
 
-> 共 15 页。每页含:标题 / 要点 / 建议视觉 / 口播备注一句。评分导向:任务完成度30% · 技术先进性25% · 性能指标20% · 开源规范性15% · 答辩展示10%。所有性能数字保持诚实框架。
+> 共 16 页。每页含:标题 / 要点 / 建议视觉 / 口播备注一句。评分导向:任务完成度30% · 技术先进性25% · 性能指标20% · 开源规范性15% · 答辩展示10%。所有性能数字保持诚实框架。
 
 ---
 
@@ -102,7 +102,18 @@
 - 建议视觉:K vs 吞吐折线图(ylong 明显高于 libcurl-threads),标注 +30%
 - 口播:异步真正的主场是海量连接少线程——这里我们稳稳达成 ≥20%。
 
-### 12. P99 与时延维度
+### 12. 平台专项优化:RISC-V 向量-AES ISA 感知密码优选
+- 要点:
+  - 现象:测试板(SpacemiT,`mvendorid 0x710`)ISA 串含向量密码扩展 `zvkned zvkg zvknha`(向量 AES + 向量 GHASH),但 perf 显示 TLS 竟协商到**最慢**的 TLS1.2 ChaCha20
+  - 硬件事实:`openssl speed`(16KB 块)AES-128-GCM ≈2377 MB/s vs ChaCha20 ≈373 MB/s(**≈6.4×**);关掉扩展(`OPENSSL_riscvcap=""`)后 AES-GCM 仅 70 MB/s < ChaCha20——**没有向量 AES 时 AES 反而更慢**,证明优化由硬件条件驱动
+  - 方案:新增公开 API `TlsConfigBuilder::prefer_hardware_aead()`(任意 TlsConfig,含代理跳)与 `ClientBuilder::tls_prefer_hardware_aead()`(目标/源);检测 `Zvkned` 后对 TLS1.2 优选 AES-GCM(TLS1.3 已默认 AES 优先)。**非 RISC-V 零影响**:检测体 `#[cfg(riscv64 & linux)]` 门控、其它平台编译为空操作、且 opt-in
+  - 实测(`BENCH_HW_AEAD=1`,客户端自动选、不钉服务端):单连接 1KB 4183→4445 req/s(+6.3%)、256KB 221→504 req/s(**+128%,2.3×**),P99 4.57→2.08ms
+  - **ISA 感知的 ylong 单连接即超过默认 libcurl**(默认 libcurl 仍停 ChaCha20):1KB +8.4%、256KB +39.9%
+- 建议视觉:`openssl speed` AES-GCM vs ChaCha20 对比条形图 + 单连接 cipher A/B 表(开/关 ISA 优选的 RPS 与 P99)
+- 口播:板子有向量 AES 却在跑最慢的 ChaCha20——我们让客户端按 ISA 自动选 AES-GCM,单连接立刻反超默认 libcurl。
+- 诚实界定(讲稿旁注):这是「ISA 感知客户端 vs 默认客户端」的优势,对称同密码则回到持平;256KB 绝对值仍含同机 co-location 成分,但 +128% 自对比与「自动选择 = 服务端钉定同吞吐」是干净结论。
+
+### 13. P99 与时延维度
 - 要点:
   - 基准输出 P50/P90/P99/P99.9 分位,不止平均值
   - 单连接单请求延迟:ylong ≈0.23ms / libcurl 库 ≈0.24ms / curl CLI ≈0.31ms
@@ -111,7 +122,7 @@
 - 建议视觉:P50/P90/P99/P99.9 分位柱状 + 时延注入前后差距收窄示意
 - 口播:我们看的是尾延迟和网络维度,而不是只报一个好看的平均数。
 
-### 13. 与 libcurl 对比总表
+### 14. 与 libcurl 对比总表
 - 要点:
   - 单连接(vs 库):持平 ≈+1.5%
   - 高并发受限 CPU(vs threads):≈+30%(RISC-V,达成 ≥20%)
@@ -120,7 +131,7 @@
 - 建议视觉:四行对比总表,达成项绿、未认证项灰并注明原因
 - 口播:一张表说清我们赢在哪、平在哪、以及哪块我们诚实地不下结论。
 
-### 14. 社区贡献与 PR 就绪
+### 15. 社区贡献与 PR 就绪
 - 要点:
   - 公共 API 仅 additive(`tls_config` / `private_key_file` / 公开 `alpn_protocols`),不破坏签名
   - 附示例 `async_proxy_https.rs`、模块级 rustdoc(含「如何加代理协议」)、benchmark 方法学
@@ -129,10 +140,11 @@
 - 建议视觉:文件清单 + 「additive API / 全组合编译 / 文档齐全」三枚就绪徽章
 - 口播:改动是加法、有文档有示例、能干净编译——随时可提社区 PR。
 
-### 15. 总结与展望
+### 16. 总结与展望
 - 要点:
   - 三子任务:HTTPS 代理与 mTLS 完成 / 模块化可扩展完成 / 性能场景达成 ≥20% 且如实界定
   - 核心价值:安全(凭据进 TLS)+ 可扩展(TunnelConnect)+ 可信(严谨诚实的性能)
+  - 亮点:**RISC-V 向量-AES ISA 感知密码优选**(`prefer_hardware_aead`),ISA 感知客户端单连接即反超默认 libcurl(1KB +8.4% / 256KB +39.9%)
   - 展望:实现 SOCKS(验证抽象)、单线程运行时/绑核作为少连接优化开关、对 curl_multi 做 `socket_action`+epoll 严谨对比
   - 一句话:能证明的才写,撤回一切经不起复核的数字
 - 建议视觉:三子任务完成度雷达图 + 展望路线条
